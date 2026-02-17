@@ -1,0 +1,891 @@
+---
+title: "Ch 1: Synthetic control- Frequentist [Step 2- placebo models]"
+author: "Molly Caldwell"
+date: "22-October-2024"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(future)
+library(furrr)
+library(progressr)
+library(sf)
+library(gsynth)
+library(data.table)
+```
+
+```{r}
+syn_list <- readRDS("C:/Users/mcaldwe2/Downloads/syn_data_list_week_control.rds")
+```
+
+# Generate placebo data
+
+```{r}
+# Clean/wrangle data
+donor_pd <- bind_rows(syn_list)
+rm(syn_list)
+
+# categorize treated individuals
+donor_pd <- donor_pd %>% 
+  group_by(cid_period) %>% 
+  mutate(treated = if_else(sum(treatment) > 0, "treated", "donor"))
+
+
+# summarize donor/treated individuals per seas
+summ <- donor_pd %>% 
+  group_by(treated, season, species, species2) %>% 
+  distinct(cid, int_id1, int_id2, date_int, .keep_all = TRUE) %>% 
+  summarize(n_id = n())
+
+# remove treated individuals
+donor_pd <- donor_pd %>% 
+  filter(treated == "donor")
+
+# remove duplicates
+donor_pd <- as.data.table(donor_pd)
+donor_pd <- donor_pd[!duplicated(donor_pd)]
+```
+
+```{r}
+# filter out individuals without enough pre-interaction steps (< 7 non-pronghorn, < 5 pronghorn)
+# first, add treat periods (pre and post treatment)
+# then, calculate number of steps per individual and treat period
+donor_pd <- donor_pd %>% 
+  mutate(treat_period = case_when(
+    species != "pronghorn" & time_seq < 13 ~ "pre",
+    species == "pronghorn" & time_seq < 12 ~ "pre",
+    TRUE ~ "post")) %>% 
+ mutate(cid_period = paste(cid, int_id1, int_id2, date_int, period_group, sep = "_")) %>% 
+  filter(!is.na(speed)) %>% 
+  filter(!is.na(rel.angle)) %>% 
+  filter(!is.na(Biomass_ForbsGrasses)) %>% 
+  filter(!is.na(Cover_Trees)) 
+
+donor_pd <- donor_pd %>% 
+  mutate(pre_treat = if_else(treat_period == "pre", 1, 0),
+         post_treat = if_else(treat_period == "post", 1, 0)) %>% 
+  group_by(cid_period) %>% 
+  mutate(pre_treat = sum(pre_treat),
+         post_treat = sum(post_treat))
+
+# filter to at least pre-treat 7 steps for non- pronghorn and at least 4 for pronghorn
+donor_pd <- donor_pd %>% 
+  filter((species != "pronghorn" & pre_treat >= 7) | 
+           (species == "pronghorn" & pre_treat >= 4))
+
+# filter to data including post treatment steps 14, 15 (non-pronghorn), and 16 (pronghorn)
+donor_pd <- donor_pd %>% 
+  mutate(post_compl = case_when(
+    species == "pronghorn" & time_seq %in% c(14,16) ~ TRUE,
+    species != "pronghorn" & time_seq %in% c(14,15) ~ TRUE,
+    TRUE ~ FALSE
+  )) %>% 
+  group_by(cid_period) %>%
+  mutate(post_compl = sum(post_compl)) %>% 
+  ungroup()
+  
+
+donor_pd <- donor_pd %>% 
+  filter(post_compl >= 2)
+
+# set the season the same across the cid_period (some split across 2 seasons)
+donor_pd <- donor_pd %>% 
+  group_by(cid_period) %>% 
+  mutate(season = first(season)) %>% 
+  ungroup()
+
+
+# sample to 1000 donors per species pair and season with those >1000
+u_ids <- donor_pd %>% 
+  group_by(season, species, species2) %>% 
+  distinct(cid_period) %>% 
+  mutate(no_id = n()) %>% 
+  ungroup()
+
+samp_ids <- u_ids %>% 
+  filter(no_id > 1000) %>% 
+  group_by(season, species, species2) %>% 
+  sample_n(1000, replace = FALSE) %>% 
+  ungroup()
+
+samp_ids <- bind_rows(samp_ids, u_ids %>% filter(no_id <= 1000))
+
+samp_ids$sample <- "sample"
+
+donor_samp <- left_join(donor_pd, samp_ids)
+
+donor_samp <- donor_samp %>% 
+  filter(sample == "sample")
+
+
+#rm(donor_pd)
+rm(u_ids)
+
+
+# split into list to iterate over
+donor_samp <- donor_samp %>% 
+  group_by(species, species2, season) %>% 
+  group_split()
+
+# remove un-needed objects
+rm(list = c("donor_pd", "samp_ids"))
+
+```
+
+```{r}
+# function for changing the treated individual across all ids per species pair and season
+set_treat_donorID <- function(data){
+  all_id <- unique(as.character(data$cid_period))
+  T0 <- ifelse(data$species[[1]] == "pronghorn", 12, 13)
+  
+ map(all_id, ~ {data2 <- data %>%
+      mutate(treatment = if_else(cid_period == .x & time_seq >= T0, 1, 0))
+  })
+}
+
+
+# function for running gsynth on donors
+run_gsynth_donor <- function(data) {
+    
+   treat <- data %>% filter(treatment == 1) %>% 
+    na.omit(Biomass_ForbsGrasses)
+  
+  untreat <- data %>% filter(cid_period == treat$cid_period[[1]]
+                             & treatment == 0)
+  
+  seas <- data %>%  select(season) %>% na.omit()
+  seas <- seas[1,]
+  
+  if(treat$species[[1]] == "pronghorn"){
+    
+    if(seas$season %in% c("spring", "summer")){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, Biomass_ForbsGrasses,
+         Cover_Trees, IRG_scaled, NDVI_scaled, x, y, rel.angle, angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                angle_change+ x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+}
+  if(seas$season == "winter"){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, SnowDepth, x, y, rel.angle, 
+           angle_change) 
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+}else{
+  
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, x, y, rel.angle, 
+           angle_change) 
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+}
+
+# create dataframe of model & sample data
+  species <- data$species[1]
+  species2 <- data$species2[1]
+  cid <- data$cid[1]
+  id1 <- data$int_id1[1]
+  id2 <- data$int_id2[1]
+  date_int <- data$date_int[1]
+  season <- seas$season[1]
+  time_period <- out_speed[["time"]]
+  post_treat <- out_speed[["post"]][,1]
+  speed_syn <- out_speed[["Y.ct"]][,1]
+  speed_treat <- out_speed[["Y.tr"]][,1]
+  speed_eff <- out_speed[["eff"]][,1]
+  speed_MSPE <- out_speed[["MSPE"]]
+  speed_sigma2 <- out_speed[["sigma2"]]
+  angle_syn <- out_angle[["Y.ct"]][,1]
+  angle_treat <- out_angle[["Y.tr"]][,1]
+  angle_eff <- out_angle[["eff"]][,1]
+  angle_MSPE <- out_angle[["MSPE"]]
+  angle_sigma2 <- out_angle[["sigma2"]]
+  
+df <- data.frame(cid, species, species2, id1, id2, date_int, season, time_period,
+                 post_treat, speed_syn, speed_treat, speed_eff, speed_MSPE,
+                 speed_sigma2, angle_syn, angle_treat, angle_eff, angle_MSPE,
+                 angle_sigma2)
+    
+return(df)   
+    
+}else{
+
+  if(seas$season %in% c("spring", "summer")){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, Biomass_ForbsGrasses,
+         Cover_Trees, IRG_scaled, NDVI_scaled, x, y, rel.angle, angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                angle_change+ x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+}
+  if(seas$season == "winter"){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, SnowDepth, x, y, rel.angle, 
+           angle_change) 
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+}else{
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, x, y, rel.angle, 
+           angle_change) 
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+}
+
+# create dataframe of model & sample data
+  species <- data$species[1]
+  species2 <- data$species2[1]
+  cid <- data$cid[1]
+  id1 <- data$int_id1[1]
+  id2 <- data$int_id2[1]
+  date_int <- data$date_int[1]
+  season <- seas$season[1]
+  time_period <- out_speed[["time"]]
+  post_treat <- out_speed[["post"]][,1]
+  speed_syn <- out_speed[["Y.ct"]][,1]
+  speed_treat <- out_speed[["Y.tr"]][,1]
+  speed_eff <- out_speed[["eff"]][,1]
+  speed_MSPE <- out_speed[["MSPE"]]
+  speed_sigma2 <- out_speed[["sigma2"]]
+  angle_syn <- out_angle[["Y.ct"]][,1]
+  angle_treat <- out_angle[["Y.tr"]][,1]
+  angle_eff <- out_angle[["eff"]][,1]
+  angle_MSPE <- out_angle[["MSPE"]]
+  angle_sigma2 <- out_angle[["sigma2"]]
+  
+df <- data.frame(cid, species, species2, id1, id2, date_int, season, time_period,
+                 post_treat, speed_syn, speed_treat, speed_eff, speed_MSPE,
+                 speed_sigma2, angle_syn, angle_treat, angle_eff, angle_MSPE,
+                 angle_sigma2)
+
+return(df)
+}
+}
+
+# Wrap function with safely
+safe_run_donor <- safely(run_gsynth_donor, otherwise = "ERROR")
+```
+
+```{r}
+# create donor data list, switching the id that is treated
+donor_treat <- map(donor_samp, set_treat_donorID, .progress = TRUE)
+
+# filter donor data list to ids within 1 week before and after of the treatment
+for(i in 1:length(donor_treat)){
+  print(i)
+donor_treat[[i]] <- map(donor_treat[[i]], function(data){
+  treat <- data %>% filter(treatment == 1)
+  treat_date <- min(treat$date, na.rm = T)
+  data <- data %>% filter(date >= (treat_date - hours(24*7)) &
+           date <= (treat_date + hours(24*7)))
+  return(data)
+}, .progress = TRUE)
+}
+
+```
+
+
+```{r}
+plan(multisession, workers = availableCores() - 1) # start parallel session
+
+options(future.globals.maxSize = 60 * 1024^3) # increase memory size
+
+# Enable progress reporting
+handlers("progress")
+
+# Initialize progress bar and run models in parallel
+donor_models <- with_progress({
+  p <- progressor(along = donor_treat)
+  
+  future_map(donor_treat, ~{
+    p()
+    future_map(.x, ~ safe_run_donor(.x), .options = furrr_options(seed = TRUE))
+  })
+})
+
+plan(sequential)
+
+
+# save output
+saveRDS(donor_models, "C:/Users/mcaldwe2/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/gsynth_placebo_output.rds")
+```
+
+```{r}
+spp <- c()
+for(i in 1:length(donor_treat)){
+  spp <- c(spp, paste(donor_treat[[i]][[1]]$species[[1]], donor_treat[[i]][[1]]$species2[[1]], sep = "_"))
+}
+
+names(donor_treat) <- spp
+```
+
+
+
+
+# plot range of treatment effects per interaction type
+
+```{r}
+# first, remove the models that had errors
+for(i in 1:length(out_list)){
+  print(i)
+  for(j in 1:length(out_list[[i]])){
+    out_list[[i]] <- out_list[[i]][sapply(out_list[[i]], function(x) length(x[["result"]])) > 1]
+  }
+  }
+
+# add names based on interacting species
+list_names <- c()
+for(i in 1:length(syn_list)){
+  list_names <- c(list_names, paste(syn_list[[i]][[1]][1,]$species, 
+                      syn_list[[i]][[1]][1,]$species2,
+                      sep = "_"))
+}
+
+names(out_list) <- list_names
+
+# remove lists with length 0
+out_nz <- out_list[sapply(out_list, function(x) length(x) > 1)]
+```
+
+# gsynth models
+
+```{r}
+# trial
+ data2 <- syn_list[[3]][[6]] %>% 
+  mutate(rel.angle = if_else(rel.angle > 180, rel.angle-180, rel.angle)) %>% 
+  mutate(rel.angle =  if_else(rel.angle > 90, rel.angle - 90, rel.angle)) %>% 
+    mutate(rel.angle = log(rel.angle)) %>% 
+  mutate(cid_period = paste(cid, period_group, sep = "_")) %>% 
+  group_by(cid_period) %>%
+   mutate(angle_change = rel.angle - lag(rel.angle)) %>%
+   ungroup() %>%
+  mutate(cid_period = paste(cid, period_group, sep = "_")) %>% 
+    select(cid_period, time_seq, rel.angle, treatment, elev, slope, Biomass_ForbsGrasses,
+         Cover_Trees, NDVI_scaled, IRG_scaled, x, y, angle_change, season)  %>% 
+    na.omit() %>% 
+  filter(time_seq <= 15)
+  
+  out <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + NDVI_scaled + IRG_scaled + x + y + angle_change, 
+                data = data2, 
+                  index = c("cid_period","time_seq"), 
+                force = "two-way", 
+                  CV = TRUE, r = c(0, 5), 
+                se = F, EM = TRUE,
+                  inference = "nonparametric", 
+                na.rm = TRUE, min.T0 = 7)
+  
+  plot(out, type = "counterfactual", raw = "none", main="")
+```
+
+
+```{r}
+# gsynth function
+run_gsynth <- function(data){
+  
+  # clean data
+  data <- data %>% 
+    # convert speed and angle to natural logs
+    mutate(speed = if_else(speed == 0, 0.00001, speed)) %>%
+    mutate(speed = log(speed)) %>% 
+    mutate(rel.angle = if_else(rel.angle > 180, rel.angle-180, rel.angle)) %>% 
+    mutate(rel.angle =  if_else(rel.angle > 90, rel.angle - 90, rel.angle)) %>% 
+    mutate(rel.angle = log(rel.angle)) %>% 
+    mutate(cid_period = paste(cid, period_group, sep = "_")) %>%
+    group_by(cid_period) %>%
+    #take change in speed and angle
+   mutate(speed_change = speed - lag(speed)) %>%
+    mutate(angle_change = rel.angle -lag(rel.angle)) %>% 
+   ungroup() %>%
+    select(cid_period, time_seq, speed, rel.angle, treatment, elev, slope, Biomass_ForbsGrasses,
+         Cover_Trees, NDVI_scaled, IRG_scaled, SnowDepth, x, y, speed_change, 
+         angle_change, season, cid, int_id1, int_id2, species, species2, date_int)  %>% 
+  filter(time_seq <= 16)
+
+  treat <- data %>% filter(cid == data$int_id1[[1]] & treatment == 1) %>% 
+    na.omit(Biomass_ForbsGrasses)
+  
+  untreat <- data %>% filter(cid_period == paste0(data$int_id1[[1]], "_4")
+                             & treatment == 0)
+  
+  seas <- data %>% na.omit(season) %>% distinct(season)
+  
+  if(treat$species[[1]] == "pronghorn"){
+    nt <- nrow(treat)*2
+    nu <- nrow(untreat)*2
+  }else{
+    nt <- nrow(treat)
+    nu <- nrow(untreat)
+  }
+
+if(nt == 4 & nu > 8){
+  if(seas$season %in% c("spring", "summer")){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, Biomass_ForbsGrasses,
+         Cover_Trees, IRG_scaled, NDVI_scaled, x, y, rel.angle, angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                angle_change+ x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+}
+  if(seas$season == "winter"){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, SnowDepth, x, y, rel.angle, 
+           angle_change) 
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                rel.angle + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+}else{
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, x, y, rel.angle, 
+           angle_change) 
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + rel.angle + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+}
+}else{
+  out_speed <- "Error: treatment period"
+  out_angle <- "Error: treatment period"
+
+}
+return(list(out_speed, out_angle))  
+}
+
+  # Wrap `run_gsynth` with safely
+  safe_run_gsynth <- safely(run_gsynth, otherwise = "ERROR")
+
+```
+
+
+```{r}
+plan(multisession(workers = availableCores()-2))
+out_list <- list()
+# 
+# for(i in 1:length(syn_list)){
+#   temp <- list()
+#   for(j in 1:length(syn_list[[i]])){
+#     print(paste("i: ", i, " j: ", j))
+# 
+#     temp[[j]] <- run_gsynth(syn_list[[i]][[j]])
+#   }
+#  out_list[[i]] <- temp
+# }
+
+for(i in 1:length(syn_list)){
+print(paste("i: ", i))
+
+out_list[[i]] <- with_progress({
+  p <- progressor(steps = length(syn_list[[i]]))
+
+  future_map(syn_list[[i]], ~{
+    p()
+    safe_run_gsynth(.x)
+  }, .options = furrr_options(seed = TRUE))
+})
+}
+
+plan(sequential)
+
+saveRDS(out_list, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/gsynth_out_week_controls.rds")
+```
+
+
+
+
+```{r}
+# extract treat effects at the interaction
+treat_effect0 <- list()
+
+for(i in 1:length(out_nz)){
+  treat_effect0[[i]] <- map_dbl(out_nz[[i]], function(x) x[["result"]][["eff"]][12,])
+}
+
+for(i in 1:length(treat_effect0)){
+  treat_effect0[[i]] <- data.frame(effect0 = treat_effect0[[i]],
+                                   spp_int = names(out_nz)[[i]])
+}
+
+treat_effect0 <- bind_rows(treat_effect0)
+
+# plot
+library(ggridges)
+
+# Step 1: Calculate the mean effect0 for each group
+treat_effect0 <- treat_effect0 %>%
+  group_by(spp_int) %>%
+  mutate(mean_effect0 = mean(effect0)) %>% 
+  mutate(mean_color = case_when(
+    mean_effect0 <= -0.001 ~ "Slower",
+     mean_effect0 >= 0.001 ~ "Faster",
+    TRUE ~ "No change"
+  ))
+
+# Step 2: Add geom_vline to the plot
+ggplot(treat_effect0, aes(x = effect0, y = spp_int, fill = mean_color)) +
+  geom_density_ridges(alpha = 0.5, quantile_lines=TRUE, quantile_fun=function(effect0,...)mean(effect0)) +
+  scale_x_continuous(limits = c(-0.15, 0.15)) +
+  theme_ridges() +
+  scale_fill_manual(values = c("Slower" = "cornflowerblue", 
+                             "No change" = "grey60",
+                             "Faster" = "red4")) +
+  labs(fill = "",
+       y = "Interacting species",
+       x = "Effect on speed") +
+  theme(legend.position = "bottom",
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(vjust = 2, hjust = 0.5))
+
+
+```
+
+
+# Extra code
+
+```{r}
+syn_data <- syn_list[[3]][[1]] %>% 
+  mutate(date = as.POSIXct(round(date, "hour")))
+
+
+date_min <- min(syn_data$date) - hours(24*7)
+date_max <- max(syn_data$date) + hours(24*7)
+  
+  
+cbi <- gps_data %>%
+  st_as_sf() %>% 
+  mutate(x = st_coordinates(.)[,1],
+         y = st_coordinates(.)[,2]) %>% 
+  st_drop_geometry() %>% 
+  mutate(date = as.POSIXct(round(date, "hour"))) %>% 
+  filter(cid == "BI100" & date >= date_min & date <= date_max) %>% 
+  mutate(treatment = 0) %>% 
+  arrange(date) %>% 
+  mutate(time_seq = rep_len(1:24, nrow(.))) %>% 
+  mutate(cid = rep(paste0("BI100_C", 1:8, na.rm = T), each = 24)[1:183])
+  
+
+syn_data <- bind_rows(syn_data, cbi)
+
+syn_data <- syn_data %>% 
+  group_by(cid) %>% 
+  mutate(nobs = n()) %>% 
+  ungroup() %>% 
+  filter(nobs >= 24) %>% 
+   mutate(cid = as.numeric(factor(cid))) %>% 
+  arrange(cid, time_seq) %>% 
+  mutate(speed = speed*3.6)
+
+#create change in speed variable
+syn_data <- syn_data %>%
+  group_by(cid) %>%
+  mutate(speed_change = speed - lag(speed)) %>%
+  ungroup() 
+
+# create hr variable
+syn_data <- syn_data %>% 
+  mutate(hr = hour(date))
+
+# scale variables
+syn_data <- syn_data %>% 
+  mutate(across(c(elev:rel.angle, na.rm = T), ~as.numeric(scale(.))))
+
+syn_data <- syn_data %>% 
+  select(cid, time_seq, speed, elev, slope, TRI, Biomass_ForbsGrasses, Cover_Trees,
+         IRG_scaled, NDVI_scaled, rel.angle, x, y) 
+
+syn_data$speed_n <- log(syn_data$speed)
+
+syn_data_l <- syn_data %>% 
+  group_by(cid) %>% 
+   mutate(group = rep(1:(n() / 2), each = 2)) %>%
+  group_by(cid, group) %>%
+  summarise(across(everything(), mean)) %>% 
+  ungroup()
+```
+
+
+```{r}
+synth_out <-
+   syn_data %>%
+  
+  # initial the synthetic control object
+  synthetic_control(outcome = speed_n, # outcome
+                    unit = cid, # unit index in the panel data
+                    time = time_seq, # time index in the panel data
+                    i_unit = 1, # unit where the intervention occurred
+                    i_time = 13, # time period when the intervention occurred
+                    generate_placebos=T # generate placebo synthetic controls (for inference)
+                    ) %>%
+   generate_predictor(time_window = 1:2,
+                    elev = mean(elev, na.rm = T),
+                     slope = mean(slope, na.rm = T),
+                     TRI = mean(TRI, na.rm = T),
+                     Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+                     Cover_Trees = mean(Cover_Trees, na.rm = T),
+                    IRG_scaled = mean(IRG_scaled, na.rm = T),
+                    NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+                    speed = mean(speed, na.rm = T),
+                    speed_change = mean(speed_change, na.rm = T),
+                    rel.angle = mean(rel.angle, na.rm = T),
+                    x = mean(x, na.rm = T),
+                    y = mean(y, na.rm = T)) %>% 
+   generate_predictor(time_window = 3:4,
+                    elev = mean(elev, na.rm = T),
+                     slope = mean(slope, na.rm = T),
+                     TRI = mean(TRI, na.rm = T),
+                     Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+                     Cover_Trees = mean(Cover_Trees, na.rm = T),
+                    IRG_scaled = mean(IRG_scaled, na.rm = T),
+                    NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+                    speed = mean(speed, na.rm = T),
+                    speed_change = mean(speed_change, na.rm = T),
+                    rel.angle = mean(rel.angle, na.rm = T),
+                    x = mean(x, na.rm = T),
+                    y = mean(y, na.rm = T)) %>%
+  generate_predictor(time_window = 5:6,
+                    elev = mean(elev, na.rm = T),
+                     slope = mean(slope, na.rm = T),
+                     TRI = mean(TRI, na.rm = T),
+                     Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+                     Cover_Trees = mean(Cover_Trees, na.rm = T),
+                    IRG_scaled = mean(IRG_scaled, na.rm = T),
+                    NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+                    speed = mean(speed, na.rm = T),
+                    rel.angle = mean(rel.angle, na.rm = T),
+                    speed_change = mean(speed_change, na.rm = T),
+                    x = mean(x, na.rm = T),
+                    y = mean(y, na.rm = T)) %>%
+  generate_predictor(time_window = 7:8,
+                    elev = mean(elev, na.rm = T),
+                     slope = mean(slope, na.rm = T),
+                     TRI = mean(TRI, na.rm = T),
+                     Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+                     Cover_Trees = mean(Cover_Trees, na.rm = T),
+                    IRG_scaled = mean(IRG_scaled, na.rm = T),
+                    NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+                    speed = mean(speed, na.rm = T),
+                    speed_change = mean(speed_change, na.rm = T),
+                    rel.angle = mean(rel.angle, na.rm = T),
+                    x = mean(x, na.rm = T),
+                    y = mean(y, na.rm = T)) %>%
+    generate_predictor(time_window = 9:10,
+                    elev = mean(elev, na.rm = T),
+                     slope = mean(slope, na.rm = T),
+                     TRI = mean(TRI, na.rm = T),
+                     Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+                     Cover_Trees = mean(Cover_Trees, na.rm = T),
+                    IRG_scaled = mean(IRG_scaled, na.rm = T),
+                    NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+                    speed = mean(speed, na.rm = T),
+                    rel.angle = mean(rel.angle, na.rm = T),
+                    speed_change = mean(speed_change, na.rm = T),
+                    x = mean(x, na.rm = T),
+                    y = mean(y, na.rm = T)) %>%
+    generate_predictor(time_window = 11:12,
+                    elev = mean(elev, na.rm = T),
+                     slope = mean(slope, na.rm = T),
+                     TRI = mean(TRI, na.rm = T),
+                     Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+                     Cover_Trees = mean(Cover_Trees, na.rm = T),
+                    IRG_scaled = mean(IRG_scaled, na.rm = T),
+                    NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+                    speed = mean(speed, na.rm = T),
+                    speed_change = mean(speed_change, na.rm = T),
+                    rel.angle = mean(rel.angle, na.rm = T),
+                    x = mean(x, na.rm = T),
+                    y = mean(y, na.rm = T)) %>%
+  #   generate_predictor(time_window = 7,
+  #                   elev = mean(elev, na.rm = T),
+  #                    slope = mean(slope, na.rm = T),
+  #                    TRI = mean(TRI, na.rm = T),
+  #                    Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+  #                    Cover_Trees = mean(Cover_Trees, na.rm = T),
+  #                   IRG_scaled = mean(IRG_scaled, na.rm = T),
+  #                   NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+  #                   speed = mean(speed, na.rm = T),
+  #                   rel.angle = mean(rel.angle, na.rm = T),
+  #                   x = mean(x, na.rm = T),
+  #                   y = mean(y, na.rm = T)) %>%  
+  #   generate_predictor(time_window = 8,
+  #                   elev = mean(elev, na.rm = T),
+  #                    slope = mean(slope, na.rm = T),
+  #                    TRI = mean(TRI, na.rm = T),
+  #                    Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+  #                    Cover_Trees = mean(Cover_Trees, na.rm = T),
+  #                   IRG_scaled = mean(IRG_scaled, na.rm = T),
+  #                   NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+  #                   speed = mean(speed, na.rm = T),
+  #                   rel.angle = mean(rel.angle, na.rm = T),
+  #                   x = mean(x, na.rm = T),
+  #                   y = mean(y, na.rm = T)) %>%  
+  #   generate_predictor(time_window = 9,
+  #                   elev = mean(elev, na.rm = T),
+  #                    slope = mean(slope, na.rm = T),
+  #                    TRI = mean(TRI, na.rm = T),
+  #                    Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+  #                    Cover_Trees = mean(Cover_Trees, na.rm = T),
+  #                   IRG_scaled = mean(IRG_scaled, na.rm = T),
+  #                   NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+  #                   speed = mean(speed, na.rm = T),
+  #                   rel.angle = mean(rel.angle, na.rm = T),
+  #                   x = mean(x, na.rm = T),
+  #                   y = mean(y, na.rm = T)) %>%  
+  #   generate_predictor(time_window = 10,
+  #                   elev = mean(elev, na.rm = T),
+  #                    slope = mean(slope, na.rm = T),
+  #                    TRI = mean(TRI, na.rm = T),
+  #                    Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+  #                    Cover_Trees = mean(Cover_Trees, na.rm = T),
+  #                   IRG_scaled = mean(IRG_scaled, na.rm = T),
+  #                   NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+  #                   speed = mean(speed, na.rm = T),
+  #                   rel.angle = mean(rel.angle, na.rm = T),
+  #                   x = mean(x, na.rm = T),
+  #                   y = mean(y, na.rm = T)) %>% 
+  #   generate_predictor(time_window = 11,
+  #                   elev = mean(elev, na.rm = T),
+  #                    slope = mean(slope, na.rm = T),
+  #                    TRI = mean(TRI, na.rm = T),
+  #                    Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+  #                    Cover_Trees = mean(Cover_Trees, na.rm = T),
+  #                   IRG_scaled = mean(IRG_scaled, na.rm = T),
+  #                   NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+  #                   speed = mean(speed, na.rm = T),
+  #                   rel.angle = mean(rel.angle, na.rm = T),
+  #                   x = mean(x, na.rm = T),
+  #                   y = mean(y, na.rm = T)) %>%  
+  #   generate_predictor(time_window = 12,
+  #                   elev = mean(elev, na.rm = T),
+  #                    slope = mean(slope, na.rm = T),
+  #                    TRI = mean(TRI, na.rm = T),
+  #                    Biomass_ForbsGrasses = mean(Biomass_ForbsGrasses, na.rm = T),
+  #                    Cover_Trees = mean(Cover_Trees, na.rm = T),
+  #                   IRG_scaled = mean(IRG_scaled, na.rm = T),
+  #                   NDVI_scaled = mean(NDVI_scaled, na.rm = T),
+  #                   speed = mean(speed, na.rm = T),
+  #                   rel.angle = mean(rel.angle, na.rm = T),
+  #                   x = mean(x, na.rm = T),
+  #                   y = mean(y, na.rm = T)) %>%  
+  generate_weights() %>% 
+  # Generate the synthetic control
+  generate_control()
+
+```
+
+```{r}
+synth_out %>% plot_trends()
+synth_out %>% grab_significance()
+synth_out %>% grab_predictors(type = "control")
+```

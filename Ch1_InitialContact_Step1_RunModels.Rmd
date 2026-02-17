@@ -1,0 +1,173 @@
+---
+title: "Ch 1: Initial Contact"
+subtitle: "Step 1: Run Models"
+author: "Molly Caldwell"
+date: "2025-02-24"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(corrr)
+library(mclogit)
+library(MuMIn)
+```
+
+# load interaction data
+
+```{r}
+data <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/gps_contact_data.rds")
+```
+
+# pre-model data prep
+
+```{r}
+# set all categorical data as factors
+data <- data %>% 
+  mutate(across(c("time_of_day", "season", "species", "yr", 
+                  "travel_state", "contact", "cid"), as.factor))
+```
+
+```{r}
+# assess correlation between variables of interest
+# first, the landscape scale GIS metrics & behavioral metrics
+data %>%
+  select(herb_biom, tree_cover, TRI_90m, travel_state, 
+         time_of_day, HR_size_km2) %>% 
+  correlate() %>%
+  rearrange() %>%
+  shave() 
+
+
+# then, the local scale GIS metrics & behavioral metrics
+data %>%
+  select(rel_herb_biom, rel_tree_cover, rel_TRI_90m, 
+         travel_state, time_of_day, HR_size_km2) %>% 
+  correlate() %>%
+  rearrange() %>%
+  shave() 
+
+```
+
+```{r}
+# scale and center the continuous variables
+data <- data %>% 
+  mutate(across(c("herb_biom", "tree_cover", "TRI_90m", "HR_size_km2",
+                  "rel_herb_biom", "rel_tree_cover",
+                  "rel_TRI_90m"), ~as.numeric(scale(.))))
+
+```
+
+# Models
+Per species
+
+```{r}
+# pull species
+spp <- unique(data$species)
+
+# create model list to save all models in
+mod_list <- vector("list", 5) 
+
+# create aic list to save aic tables
+aic_list <- list()
+
+# run models
+for(i in 1:length(spp)){
+  print(i)
+
+df <- data %>% filter(species == spp[[i]])
+
+# actual gis global
+mod_list[[i]][["global_actual_gis"]] <- mblogit(contact ~ herb_biom +
+                          tree_cover +
+                          TRI_90m +
+                          time_of_day +
+                          HR_size_km2 +
+                          travel_state +
+                          season,
+                          random = (~1|cid),
+                          data = df)
+
+
+#relative GIS global
+mod_list[[i]][["global_relative_gis"]] <-  mblogit(contact ~ rel_herb_biom +
+                          rel_tree_cover +
+                          rel_TRI_90m +
+                          time_of_day +
+                          HR_size_km2 +
+                          travel_state +
+                          season,
+                          random = (~1|cid),
+                          data = df)
+
+
+# now, compare spatial environment vs spatial and social behavior models
+mod_list[[i]][["spatial"]] <- mblogit(contact ~ herb_biom +
+                          tree_cover +
+                          TRI_90m +
+                          season,
+                          random = (~1|cid),
+                          data = df)
+
+
+mod_list[[i]][["behav"]] <- mblogit(contact ~ 
+                          HR_size_km2 +
+                          time_of_day +
+                          travel_state +
+                          season,
+                          random = (~1|cid),
+                          data = df)
+
+mod_list[[i]][["null"]] <- mblogit(contact ~ 1,
+                          random = (~1|cid),
+                          data = df)
+
+
+# full aic table
+aic_list[[i]] <- data.frame(
+  model = names(mod_list[[i]]),
+  AIC = sapply(mod_list[[i]], AIC),
+  df = sapply(mod_list[[i]], function(m) attr(logLik(m), "df"))
+)
+
+# Calculate delta AIC
+aic_list[[i]]$deltaAIC <- aic_list[[i]]$AIC - min(aic_list[[i]]$AIC)
+
+# Calculate Akaike weights
+aic_list[[i]]$weight <- with(aic_list[[i]], {
+  delta <- deltaAIC
+  rel_lik <- exp(-0.5 * delta)
+  rel_lik / sum(rel_lik)
+})
+
+# Order by AIC
+aic_list[[i]] <- aic_list[[i]][order(aic_list[[i]]$AIC), ]
+
+# round values
+aic_list[[i]] <- aic_list[[i]] %>% 
+  mutate_if(is.numeric, ~round(., digits = 2))
+
+}
+
+```
+
+```{r}
+# save aic tables as csv
+for(i in 1:length(aic_list)){
+write.csv(aic_list[[i]], row.names = FALSE,
+          file = paste0("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/InitialContact_AICtab_", spp[i], ".csv"))
+}
+```
+
+```{r}
+# save top model per species
+top_mods <- list(mod_list[[1]][["global_actual_gis"]],
+                 mod_list[[2]][["global_actual_gis"]],
+                 mod_list[[3]][["global_actual_gis"]],
+                 mod_list[[4]][["global_actual_gis"]],
+                 mod_list[[5]][["global_relative_gis"]])
+
+names(top_mods) <- spp
+
+saveRDS(top_mods, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/InitialContact_TopModel.rds")
+```

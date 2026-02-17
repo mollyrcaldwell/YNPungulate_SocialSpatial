@@ -1,0 +1,844 @@
+---
+title: "Ch 1: Synthetic control [Step 3- model assessment, pvalues]"
+author: "Molly Caldwell"
+date: "01-January-2025"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+```
+
+# load in model output
+
+Notes on treatment times:
+For non-pronghorn species, treatment starts 2 hours before contact (time period 13) and contact is at time period 14.
+
+For pronghorn, treatment starts 4 hours before contact (time period 12) and contact is at time period 14.
+
+```{r}
+# load in synthetic control models
+syn_models <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/gsynth_treated_output.rds")
+
+# load in placebo models
+plac_models <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/gsynth_placebo_output.rds")
+```
+
+```{r}
+# combine models into single dataframes
+# first, remove models that did not run
+syn_models <- map(syn_models, ~ discard(.x, ~ any(grepl("ERROR", unlist(.x)))))
+
+plac_models <- map(plac_models, ~ discard(.x, ~ any(grepl("ERROR", unlist(.x)))))
+
+# then, add a unique model ID for each model
+syn_models <- map(syn_models, ~imap(.x, ~ mutate(.x[["result"]], 
+                                                 model_id = paste(.x[["result"]]$species[[1]], 
+                                                                  .x[["result"]]$species2[[1]],
+                                                                  .x[["result"]]$season[[1]],
+                                                                  .y, sep = "_"))))
+
+
+plac_models <- map(plac_models, ~imap(.x, ~ mutate(.x[["result"]], 
+                                                 model_id = paste(.x[["result"]]$species[[1]], 
+                                                                  .x[["result"]]$species2[[1]],
+                                                                  .x[["result"]]$season[[1]],
+                                                                  .y, sep = "_"))))
+
+# then, bind data rows 
+syn_models <- bind_rows(syn_models)
+plac_models <- bind_rows(plac_models)
+```
+
+```{r}
+# add starting time period of treatment and species, species2, season ID for significance tests
+syn_models <- syn_models %>% 
+  group_by(model_id) %>%
+  mutate(treat_start = min(time_period[post_treat == TRUE], na.rm = TRUE)) %>%
+  ungroup() %>% 
+  mutate(spp_seas = paste(species, species2, season, sep = "_"))
+
+plac_models <- plac_models %>% 
+  group_by(model_id) %>%
+  mutate(treat_start = min(time_period[post_treat == TRUE], na.rm = TRUE)) %>%
+  ungroup() %>% 
+  mutate(spp_seas = paste(species, species2, season, sep = "_"))
+```
+
+```{r}
+# filter out all models (placebo and treated) that have a treatment start time other than 13 (species other than pronghorn) or 12 (for pronghorn)
+plac_models <- plac_models %>% 
+  mutate(ts_flag = case_when(
+    species != "pronghorn" & treat_start != 13 ~ 1,
+    species == "pronghorn" & treat_start != 12 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  filter(ts_flag == 0) %>% 
+  select(-ts_flag)
+
+syn_models <- syn_models %>% 
+  mutate(ts_flag = case_when(
+    species != "pronghorn" & treat_start != 13 ~ 1,
+    species == "pronghorn" & treat_start != 12 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  filter(ts_flag == 0) %>% 
+  select(-ts_flag)
+```
+
+```{r}
+#some pre-visualizing
+d1 <- syn_models %>% filter(model_id == "pronghorn_elk_winter_20")
+d2 <- plac_models %>% filter(spp_seas == "pronghorn_elk_winter")
+  
+ggplot() +
+  geom_line(data = d2, aes(x = time_period, y = speed_eff, group = model_id),
+            color = "grey", alpha = 0.2) +
+  geom_line(data = d1, aes(x = time_period, y = speed_eff)) +
+  geom_vline(data = d1, aes(xintercept = treat_start), linetype = 2) +
+  theme_classic()
+
+ggplot(d2 %>% filter(time_period == 16)) +
+  geom_histogram(aes(x = speed_eff))
+    
+```
+
+# Clean up models
+## Treatment models
+
+```{r}
+# synthetic control - treated models
+# remove models with MSE > 90% quantile of the pre-treatment fit
+# first calculate mean square error of the pre-treatment fit
+syn_models <- syn_models %>%
+  mutate(speed_sq_error = speed_eff^2,
+         angle_sq_error = angle_eff^2) %>% 
+  na.omit(speed_sq_error, angle_sq_error) %>% 
+  group_by(model_id, post_treat) %>% 
+  mutate(speed_mse = sum(speed_sq_error) / nrow(.),
+         angle_mse = sum(angle_sq_error) / nrow(.)) %>% 
+  ungroup()
+  
+# visualize the MSE
+hist(syn_models$speed_mse, breaks = 1000,
+     xlim = c(0, 0.0001))
+
+q_speed <- quantile(syn_models$speed_mse, 0.9)
+
+hist(syn_models$angle_mse, breaks = 1000,
+     xlim = c(0, 0.0001))
+
+q_angle <- quantile(syn_models$angle_mse, 0.9)
+
+# flag interactions with pre-treatment MSE > 90% quantiles
+syn_models <- syn_models %>% 
+  mutate(speed_mse_flag = if_else(speed_mse > q_speed & post_treat == FALSE, 1, 0),
+         angle_mse_flag = if_else(angle_mse > q_angle & post_treat == FALSE, 1, 0)) %>% 
+  group_by(model_id) %>%
+  mutate(speed_mse_flag = if_else(sum(speed_mse_flag) > 0, 1, 0),
+         angle_mse_flag = if_else(sum(angle_mse_flag) > 0, 1, 0)) %>% 
+  ungroup()
+
+syn_models <- syn_models %>% 
+  mutate(speed_mse_flag = as.factor(speed_mse_flag),
+         angle_mse_flag = as.factor(angle_mse_flag))
+
+```
+
+```{r}
+# visualize flagged models
+pair_seas <- unique(syn_models$spp_seas)
+
+## speed
+for(i in 1:length(pair_seas)){
+  
+p <- ggplot(syn_models %>% filter(spp_seas == pair_seas[[i]])) +
+  geom_line(aes(x = time_period, y = speed_eff, group = model_id,
+                color = speed_mse_flag, alpha = speed_mse_flag)) +
+  geom_vline(aes(xintercept = treat_start), linetype = 2) +
+  labs(title = paste(pair_seas[[i]], "speed effect", sep = " "))
+  
+print(p)
+}
+
+## angle
+for(i in 1:length(pair_seas)){
+  
+p <- ggplot(syn_models %>% filter(spp_seas == pair_seas[[i]])) +
+  geom_line(aes(x = time_period, y = angle_eff, group = model_id,
+                color = angle_mse_flag, alpha = angle_mse_flag)) +
+  geom_vline(aes(xintercept = treat_start), linetype = 2) +
+  labs(title = paste(pair_seas[[i]], "angle effect", sep = " "))
+  
+print(p)
+}
+
+```
+
+```{r}
+# create separate speed and angle model dataframes with flagged MSE removed
+speed_models <- syn_models %>% 
+  filter(speed_mse_flag == 0) %>% 
+  select(-starts_with("angle"))
+
+angle_models <- syn_models %>% 
+  filter(angle_mse_flag == 0) %>% 
+  select(-starts_with("speed"))
+
+# pull greatest MSE for speed and angle from filtered models
+speed_MSE_cutoff <- max(speed_models$speed_mse)
+angle_MSE_cutoff <- max(angle_models$angle_mse)
+```
+
+## Placebo models
+
+```{r}
+# synthetic control - placebo models
+# remove models with MSE > treated models greatest MSE of the pre-treatment fit
+# first calculate mean square error of the pre-treatment fit
+plac_models <- plac_models %>%
+  mutate(speed_sq_error = speed_eff^2,
+         angle_sq_error = angle_eff^2) %>% 
+  na.omit(speed_sq_error, angle_sq_error) %>% 
+  group_by(model_id, post_treat) %>% 
+  mutate(speed_mse = sum(speed_sq_error) / nrow(.),
+         angle_mse = sum(angle_sq_error) / nrow(.)) %>% 
+  ungroup()
+  
+# visualize the MSE
+hist(plac_models$speed_mse, breaks = 1000,
+     xlim = c(0, 0.0001))
+
+hist(plac_models$angle_mse, breaks = 1000,
+     xlim = c(0, 0.0001))
+
+# flag interactions with pre-treatment MSE > MSE of filtered, treated models
+plac_models <- plac_models %>% 
+  mutate(speed_mse_flag = if_else(speed_mse > speed_MSE_cutoff & post_treat == FALSE, 1, 0),
+         angle_mse_flag = if_else(angle_mse > angle_MSE_cutoff & post_treat == FALSE, 1, 0)) %>% 
+  group_by(model_id) %>%
+  mutate(speed_mse_flag = if_else(sum(speed_mse_flag) > 0, 1, 0),
+         angle_mse_flag = if_else(sum(angle_mse_flag) > 0, 1, 0)) %>% 
+  ungroup()
+
+plac_models <- plac_models %>% 
+  mutate(speed_mse_flag = as.factor(speed_mse_flag),
+         angle_mse_flag = as.factor(angle_mse_flag))
+
+```
+
+```{r}
+# visualize flagged models per species pair - season
+pair_seas <- unique(plac_models$spp_seas)
+
+## speed 
+for(i in 1:length(pair_seas)){
+  print(i)
+p <- ggplot(plac_models %>% filter(spp_seas == pair_seas[[i]])) +
+  geom_line(aes(x = time_period, y = speed_eff, group = model_id,
+                color = speed_mse_flag, alpha = speed_mse_flag)) +
+  geom_vline(aes(xintercept = treat_start), linetype = 2) +
+  labs(title = paste(pair_seas[[i]], "speed effect", sep = " "))
+  
+print(p)
+}
+
+## angle
+for(i in 1:length(pair_seas)){
+  
+p <- ggplot(plac_models %>% filter(spp_seas == pair_seas[[i]])) +
+  geom_line(aes(x = time_period, y = angle_eff, group = model_id,
+                color = angle_mse_flag, alpha = angle_mse_flag)) +
+  geom_vline(aes(xintercept = treat_start), linetype = 2) +
+  labs(title = paste(pair_seas[[i]], "angle effect", sep = " "))
+  
+print(p)
+}  
+
+```
+
+```{r}
+# create separate speed and angle model dataframes with flagged MSE removed
+speed_plac <- plac_models %>% 
+  filter(speed_mse_flag == 0) %>% 
+  select(-starts_with("angle"))
+
+angle_plac <- plac_models %>% 
+  filter(angle_mse_flag == 0) %>% 
+  select(-starts_with("speed"))
+```
+
+# Assess control vs. placebo significance
+
+```{r}
+# create datasets of combined control and placebo models per speed and angle
+speed_models$mod_type = "treated"
+speed_plac$mod_type = "placebo"
+
+speed_comb <- bind_rows(speed_models, speed_plac)
+
+angle_models$mod_type = "treated"
+angle_plac$mod_type = "placebo"
+
+angle_comb <- bind_rows(angle_models, angle_plac)
+```
+
+```{r}
+# visualize placebo post-treatment effects vs. treated effects (per species & season)
+spp_id <- unique(speed_comb$spp_seas)
+
+for(i in 1:length(spp_id)){
+  p_speed <- speed_comb %>% 
+              filter(spp_seas == spp_id[[i]] & time_period == treat_start) %>%
+    group_by(mod_type) %>% 
+    mutate(avg_speed_eff = mean(speed_eff)) %>% 
+    ungroup() %>% 
+    ggplot() +
+    geom_histogram(aes(x = speed_eff, y = after_stat(density), fill = mod_type,
+                       color = mod_type), 
+                   alpha = 0.7, bins = 60) +
+    geom_vline(aes(xintercept = avg_speed_eff, color = mod_type), 
+               linewidth = 1.5, linetype = 2) +
+    labs(title = paste0("Speed treatment effect vs. placebo: ", spp_id[[i]])) +
+    theme_classic()
+  
+   p_angle <- angle_comb %>% 
+              filter(spp_seas == spp_id[[i]] & time_period == treat_start) %>%
+    group_by(mod_type) %>% 
+    mutate(avg_angle_eff = mean(angle_eff)) %>% 
+    ungroup() %>%  
+    ggplot() +
+    geom_histogram(aes(x = angle_eff, y = after_stat(density), fill = mod_type,
+                       color = mod_type), 
+                   alpha = 0.7, bins = 60) +
+    geom_vline(aes(xintercept = avg_angle_eff, color = mod_type), 
+               linewidth = 1.5, linetype = 2) +
+    labs(title = paste0("Angle treatment effect vs. placebo: ", spp_id[[i]])) +
+    theme_classic()
+   
+   print(p_speed)
+   print(p_angle)
+}
+
+```
+
+## Calculate p-values
+
+```{r}
+# function to calculate p-value based on treated time
+calc_pvalue_treat <- function(treat_data, plac_data, time_sel){
+  
+  # filter placebo and treated data to time period of interest
+  plac_data <- plac_data %>% filter(time_period == time_sel)
+  treat_data <- treat_data %>%  filter(time_period == time_sel)
+  
+  # add eff column dependent on whether its speed or angle
+  if(any(grepl("speed_eff", names(treat_data)))){
+    treat_data$eff <- treat_data$speed_eff
+    plac_data$eff <- plac_data$speed_eff
+  }else{
+    treat_data$eff <- treat_data$angle_eff
+    plac_data$eff <- plac_data$angle_eff
+  }
+  
+  # then, calculate the percent rank and pvalue of each treated effect
+   dat <- treat_data %>% 
+     rowwise() %>% 
+    mutate(eff_perc_rank = sum(plac_data$eff < eff) / nrow(plac_data)) %>% 
+    ungroup() %>% 
+    mutate(eff_pvalue = if_else(eff_perc_rank >= 0.5, 1 - eff_perc_rank,
+                                eff_perc_rank)) %>% 
+     select(-eff, -eff_perc_rank)
+   
+   # rename pvalues dependent on whether its speed or angle
+  if(any(grepl("speed_eff", names(treat_data)))){
+    dat <- dat %>% 
+      rename(speed_pvalue = eff_pvalue)
+    
+  }else{
+    dat <- dat %>% 
+      rename(angle_pvalue = eff_pvalue)
+  }
+  
+  return(dat)
+}
+
+```
+
+```{r}
+# first, split treated and placebo datasets into spp-seas
+speed_models <- split(speed_models, speed_models$spp_seas)
+angle_models <- split(angle_models, angle_models$spp_seas)
+
+speed_plac <- split(speed_plac, speed_plac$spp_seas)
+angle_plac <- split(angle_plac, angle_plac$spp_seas)
+
+# time periods of interest for pvalues:
+# time of treatment (time before contact)
+# time of contact
+# time after contact
+# 2 time periods after contact
+# 13, 14, 15, 16 for non-pronghorn, and 12, 14, 16, 18 for pronghorn
+times <- c(12:18)
+# iterate the p-value function across each spp-seas and loop by time period of interest
+speed_pval <- list()
+angle_pval <- list()
+
+for(i in 1:length(times)){
+  print(i)
+  
+  speed_pval[[i]] <- map2_dfr(speed_models, speed_plac, 
+                     ~calc_pvalue_treat(.x, .y, time_sel = times[[i]]))
+  
+  angle_pval[[i]] <- map2_dfr(angle_models, angle_plac, 
+                     ~calc_pvalue_treat(.x, .y, time_sel = times[[i]]))
+}
+
+# combine lists into one dataframe
+speed_pval <- bind_rows(speed_pval)
+
+angle_pval <- bind_rows(angle_pval)
+
+# join p-value data to full model data
+speed_models <- bind_rows(speed_models)
+speed_models <- left_join(speed_models, speed_pval)
+angle_models <- bind_rows(angle_models)
+angle_models <- left_join(angle_models, angle_pval)
+```
+
+
+```{r}
+# summarize significant models
+# first, combine speed and angle models
+treat_models <- full_join(speed_models, angle_models)
+
+# add flag for significant models at each time of interest
+treat_models <- treat_models %>% 
+  mutate(
+    before_contact_sig = case_when(
+           species == "pronghorn" & time_period == 12 & speed_pvalue <= 0.05 & 
+             angle_pvalue <= 0.05 ~ "both",
+           species != "pronghorn" & time_period == 13 & speed_pvalue <= 0.05 &
+             angle_pvalue <= 0.05 ~ "both",
+           species == "pronghorn" & time_period == 12 & speed_pvalue <= 0.05 ~ "speed",
+           species != "pronghorn" & time_period == 13 & speed_pvalue <= 0.05 ~ "speed",
+           species == "pronghorn" & time_period == 12 & angle_pvalue <= 0.05 ~ "angle",
+           species != "pronghorn" & time_period == 13 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none"), 
+    contact_sig = case_when(
+          time_period == 14 & speed_pvalue <= 0.05 & angle_pvalue <= 0.05 ~ "both",
+           time_period == 14 & speed_pvalue <= 0.05 ~ "speed",
+           time_period == 14 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none"),
+    after_contact_1_sig = case_when(
+      species == "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 & 
+             angle_pvalue <= 0.05 ~ "both",
+           species != "pronghorn" & time_period == 15 & speed_pvalue <= 0.05 &
+             angle_pvalue <= 0.05 ~ "both",
+           species == "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 ~ "speed",
+           species != "pronghorn" & time_period == 15 & speed_pvalue <= 0.05 ~ "speed",
+           species == "pronghorn" & time_period == 16 & angle_pvalue <= 0.05 ~ "angle",
+           species != "pronghorn" & time_period == 15 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none"),
+    after_contact_2_sig = case_when(
+           species == "pronghorn" & time_period == 18 & speed_pvalue <= 0.05 & 
+             angle_pvalue <= 0.05 ~ "both",
+           species != "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 &
+             angle_pvalue <= 0.05 ~ "both",
+           species == "pronghorn" & time_period == 18 & speed_pvalue <= 0.05 ~ "speed",
+           species != "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 ~ "speed",
+           species == "pronghorn" & time_period == 18 & angle_pvalue <= 0.05 ~ "angle",
+           species != "pronghorn" & time_period == 16 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none")) %>% 
+  group_by(model_id) %>% 
+  mutate(before_contact_sig = case_when(
+    any(before_contact_sig == "speed") ~ "speed",
+    any(before_contact_sig == "angle") ~ "angle",
+    any(before_contact_sig == "both") ~ "both",
+    TRUE ~ "none"),
+    contact_sig = case_when(
+    any(contact_sig == "speed") ~ "speed",
+    any(contact_sig == "angle") ~ "angle",
+    any(contact_sig == "both") ~ "both",
+    TRUE ~ "none"),
+    after_contact_1_sig = case_when(
+    any(after_contact_1_sig == "speed") ~ "speed",
+    any(after_contact_1_sig == "angle") ~ "angle",
+    any(after_contact_1_sig == "both") ~ "both",
+    TRUE ~ "none"),
+    after_contact_2_sig = case_when(
+    any(after_contact_2_sig == "speed") ~ "speed",
+    any(after_contact_2_sig == "angle") ~ "angle",
+    any(after_contact_2_sig == "both") ~ "both",
+    TRUE ~ "none")) %>% 
+  ungroup() 
+```
+
+```{r}
+# remove duplicates
+treat_models <- treat_models %>% 
+  select(-model_id)
+
+treat_models <- treat_models %>% 
+  mutate(across(where(is.numeric), ~round(.,5)))
+
+treat_models <- treat_models[!duplicated(treat_models),]
+
+# save treat data with p vals
+saveRDS(treat_models, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/syn_models_output_pval.rds")
+```
+
+
+```{r}
+sig_prop <- treat_models %>%
+  distinct(id1, id2, date_int, .keep_all = TRUE) %>% 
+  group_by(spp_seas, species, after_contact_1_sig) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(spp_seas, species) %>%
+  mutate(proportion = count / sum(count))
+
+# plot number of significant models per species & season
+ggplot(sig_prop %>% filter(after_contact_1_sig != "none"), 
+       aes(x = spp_seas, y = proportion, fill = after_contact_1_sig)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~species, scales = "free") +
+  coord_flip() +
+  theme_classic() 
+```
+
+## Assess p-values with Bayesian bootstrap of placebos
+
+```{r}
+# function for bayesian bootstrap resample
+bayesian_bootstrap <- function(plac_data, time_sel, n_resamples = 1000) {
+  
+  # filter to time period of interest
+  plac_data <- plac_data %>% 
+    filter(time_period == time_sel)
+  
+  # Length of the data
+  n <- nrow(plac_data)
+  
+  # put condition to continue only if nrow plac_data > 0 (to skip models without certain time periods for pronghorn)
+  
+  if(n > 0){
+  # Generate Dirichlet weights
+  weights <- gtools::rdirichlet(1, rep(1, n))
+  
+  # create dataframe of resampled effects
+  if(any(grepl("speed_eff", names(plac_data)))){
+    # resample data with the weights
+  speed_eff <- sample(plac_data$speed_eff, 
+                      size = n_resamples, 
+                      replace = TRUE, 
+                      prob = weights)
+  
+  dat <- data.frame(spp_seas = plac_data$spp_seas[[1]], 
+                    time_period = time_sel,
+                    speed_eff = speed_eff)
+  }else{
+    # resample data with the weights
+  angle_eff <- sample(plac_data$angle_eff, 
+                      size = n_resamples, 
+                      replace = TRUE, 
+                      prob = weights)
+  
+  dat <- data.frame(spp_seas = plac_data$spp_seas[[1]], 
+                    time_period = time_sel,
+                    angle_eff = angle_eff)
+  }
+  return(dat)
+  }
+}
+
+```
+
+```{r}
+# time periods of interest for pvalues:
+# time of treatment (time before contact)
+# time of contact
+# time after contact
+# 2 time periods after contact
+# 13, 14, 15, 16 for non-pronghorn, and 12, 14, 16, 18 for pronghorn
+times <- c(12:18)
+
+# iterate the bayesian bootstrap across placebo models and time period of interest
+speed_boot <- list()
+angle_boot <- list()
+
+for(i in 1:length(times)){
+  print(i)
+  
+  speed_boot[[i]] <- map_dfr(speed_plac, 
+                        ~ bayesian_bootstrap(.x, time_sel = times[[i]]))
+  
+  angle_boot[[i]] <- map_dfr(angle_plac, 
+                        ~ bayesian_bootstrap(.x, time_sel = times[[i]]))
+}
+
+speed_boot <- bind_rows(speed_boot)
+angle_boot <- bind_rows(angle_boot)
+
+# split boot data into list by spp_seas
+speed_boot <- split(speed_boot, speed_boot$spp_seas)
+angle_boot <- split(angle_boot, angle_boot$spp_seas)
+```
+
+```{r}
+# remove pvalues if already in model data
+speed_models <- speed_models %>% 
+  select(-speed_pvalue)
+
+angle_models <- angle_models %>% 
+  select(-angle_pvalue)
+
+# split model data into list by spp_seas
+speed_models <- split(speed_models, speed_models$spp_seas)
+angle_models <- split(angle_models, angle_models$spp_seas)
+
+# iterate the p-value function across each spp-seas and loop by time period of interest
+speed_pval_boot <- list()
+angle_pval_boot <- list()
+
+for(i in 1:length(times)){
+  print(i)
+  
+  speed_pval_boot[[i]] <- map2_dfr(speed_models, speed_boot, 
+                     ~calc_pvalue_treat(.x, .y, time_sel = times[[i]]))
+  
+  angle_pval_boot[[i]] <- map2_dfr(angle_models, angle_boot, 
+                     ~calc_pvalue_treat(.x, .y, time_sel = times[[i]]))
+}
+
+# combine lists into one dataframe
+speed_pval_boot <- bind_rows(speed_pval_boot)
+
+angle_pval_boot <- bind_rows(angle_pval_boot)
+
+# join p-value data to full model data
+speed_models <- bind_rows(speed_models)
+speed_models <- left_join(speed_models, speed_pval_boot)
+angle_models <- bind_rows(angle_models)
+angle_models <- left_join(angle_models, angle_pval_boot)
+```
+
+```{r}
+# save bootstrapped placebo data
+speed_boot_df <- bind_rows(speed_boot)
+angle_boot_df <- bind_rows(angle_boot)
+
+boot_df <- speed_boot_df
+boot_df$angle_eff <- speed_boot_df$speed_eff
+
+saveRDS(boot_df, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/placebo_bayesboot_effects.rds")
+```
+
+```{r}
+# summarize significant models
+# first, combine speed and angle models
+treat_models_boot <- full_join(speed_models, angle_models)
+
+# add flag for significant models at each time of interest
+treat_models_boot <- treat_models_boot %>% 
+  mutate(
+    before_contact_sig = case_when(
+           species == "pronghorn" & time_period == 12 & speed_pvalue <= 0.05 & 
+             angle_pvalue <= 0.05 ~ "both",
+           species != "pronghorn" & time_period == 13 & speed_pvalue <= 0.05 &
+             angle_pvalue <= 0.05 ~ "both",
+           species == "pronghorn" & time_period == 12 & speed_pvalue <= 0.05 ~ "speed",
+           species != "pronghorn" & time_period == 13 & speed_pvalue <= 0.05 ~ "speed",
+           species == "pronghorn" & time_period == 12 & angle_pvalue <= 0.05 ~ "angle",
+           species != "pronghorn" & time_period == 13 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none"), 
+    contact_sig = case_when(
+          time_period == 14 & speed_pvalue <= 0.05 & angle_pvalue <= 0.05 ~ "both",
+           time_period == 14 & speed_pvalue <= 0.05 ~ "speed",
+           time_period == 14 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none"),
+    after_contact_1_sig = case_when(
+      species == "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 & 
+             angle_pvalue <= 0.05 ~ "both",
+           species != "pronghorn" & time_period == 15 & speed_pvalue <= 0.05 &
+             angle_pvalue <= 0.05 ~ "both",
+           species == "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 ~ "speed",
+           species != "pronghorn" & time_period == 15 & speed_pvalue <= 0.05 ~ "speed",
+           species == "pronghorn" & time_period == 16 & angle_pvalue <= 0.05 ~ "angle",
+           species != "pronghorn" & time_period == 15 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none"),
+    after_contact_2_sig = case_when(
+           species == "pronghorn" & time_period == 18 & speed_pvalue <= 0.05 & 
+             angle_pvalue <= 0.05 ~ "both",
+           species != "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 &
+             angle_pvalue <= 0.05 ~ "both",
+           species == "pronghorn" & time_period == 18 & speed_pvalue <= 0.05 ~ "speed",
+           species != "pronghorn" & time_period == 16 & speed_pvalue <= 0.05 ~ "speed",
+           species == "pronghorn" & time_period == 18 & angle_pvalue <= 0.05 ~ "angle",
+           species != "pronghorn" & time_period == 16 & angle_pvalue <= 0.05 ~ "angle",
+           TRUE ~ "none")) %>% 
+  group_by(model_id) %>% 
+  mutate(before_contact_sig = case_when(
+    any(before_contact_sig == "speed") ~ "speed",
+    any(before_contact_sig == "angle") ~ "angle",
+    any(before_contact_sig == "both") ~ "both",
+    TRUE ~ "none"),
+    contact_sig = case_when(
+    any(contact_sig == "speed") ~ "speed",
+    any(contact_sig == "angle") ~ "angle",
+    any(contact_sig == "both") ~ "both",
+    TRUE ~ "none"),
+    after_contact_1_sig = case_when(
+    any(after_contact_1_sig == "speed") ~ "speed",
+    any(after_contact_1_sig == "angle") ~ "angle",
+    any(after_contact_1_sig == "both") ~ "both",
+    TRUE ~ "none"),
+    after_contact_2_sig = case_when(
+    any(after_contact_2_sig == "speed") ~ "speed",
+    any(after_contact_2_sig == "angle") ~ "angle",
+    any(after_contact_2_sig == "both") ~ "both",
+    TRUE ~ "none")) %>% 
+  ungroup() 
+```
+
+```{r}
+# remove duplicates
+treat_models_boot<- treat_models_boot %>% 
+  select(-model_id)
+
+treat_models_boot <- treat_models_boot %>% 
+  mutate(across(where(is.numeric), ~round(.,5)))
+
+treat_models_boot <- treat_models_boot[!duplicated(treat_models_boot),]
+
+# save treat data with p vals
+saveRDS(treat_models_boot, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/syn_models_output_pval_bayesboot.rds")
+```
+
+```{r}
+sig_prop <- treat_models_boot %>%
+  distinct(id1, id2, date_int, .keep_all = TRUE) %>% 
+  group_by(spp_seas, species, contact_sig) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(spp_seas, species) %>%
+  mutate(proportion = count / sum(count))
+
+# plot number of significant models per species & season
+ggplot(sig_prop %>% filter(contact_sig != "none"), 
+       aes(x = spp_seas, y = proportion, fill = contact_sig)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~species, scales = "free_y") +
+  coord_flip() +
+  theme_classic() +
+  labs(y = "Proportion significant effects", x = "")
+```
+
+## compare boot pvalues to placebo data pvalues
+
+```{r}
+sig_plac <- treat_models %>%
+  distinct(model_id, .keep_all = TRUE) %>% 
+  group_by(spp_seas, species, after_contact_1_sig) %>%
+  summarise(count = n(), .groups = "drop") %>% 
+  group_by(spp_seas, species) %>%
+  mutate(proportion = count / sum(count)) %>% 
+  ungroup() %>% 
+  mutate(pval_type = "placebo")
+
+sig_boot <- treat_models_boot %>%
+  distinct(model_id, .keep_all = TRUE) %>% 
+  group_by(spp_seas, species, after_contact_1_sig) %>%
+  summarise(count = n(), .groups = "drop") %>% 
+  group_by(spp_seas, species) %>%
+  mutate(proportion = count / sum(count)) %>% 
+  ungroup() %>% 
+  mutate(pval_type = "bootstrap")
+
+sig_comp <- bind_rows(sig_plac, sig_boot) 
+
+ggplot(sig_comp %>% filter(after_contact_1_sig != "none"), 
+       aes(x = spp_seas, y = proportion, fill = pval_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~after_contact_1_sig, scales = "free") +
+  coord_flip() +
+  theme_classic() 
+```
+
+```{r}
+# bind together bootstrap values
+angle_boot <- bind_rows(angle_boot)
+speed_boot <- bind_rows(speed_boot)
+
+# visualize bootstrapped placebo post-treatment effects vs. treated effects (per species & season)
+spp_id <- unique(speed_models$spp_seas)
+
+for(i in 1:length(spp_id)){
+  
+  print(i)
+  
+  if(grepl("^pronghorn", spp_id[[i]])){
+    time = 16
+  }else{
+    time = 15
+  }
+  
+  speed <- speed_models %>% 
+    filter(spp_seas == spp_id[[i]] & time_period == time) %>% 
+    mutate(avg_speed_eff = mean(speed_eff))
+  
+   angle <- angle_models %>% 
+    filter(spp_seas == spp_id[[i]] & time_period == time) %>% 
+    mutate(avg_angle_eff = mean(angle_eff))
+   
+   speed_boot_f <- speed_boot  %>% 
+    filter(spp_seas == spp_id[[i]] & time_period == time) %>% 
+    mutate(avg_speed_eff = mean(speed_eff))
+   
+   angle_boot_f <- angle_boot %>% 
+    filter(spp_seas == spp_id[[i]] & time_period == time) %>% 
+    mutate(avg_angle_eff = mean(angle_eff))
+  
+  p_speed <- 
+    ggplot() +
+    geom_histogram(data = speed_boot_f,
+      aes(x = speed_eff, y = after_stat(density)), 
+                   fill = "darkgrey", alpha = 0.7, bins = 60) +
+    geom_vline(data = speed_boot_f,
+               aes(xintercept = avg_speed_eff), 
+               color = "black", linewidth = 1, linetype = 2) +
+    geom_histogram(data = speed,
+      aes(x = speed_eff, y = after_stat(density)), 
+                   fill = "blue", alpha = 0.5, bins = 60) +
+    geom_vline(data = speed,
+               aes(xintercept = avg_speed_eff), 
+               color = "blue", linewidth = 1, linetype = 2) +
+    labs(title = paste0("Speed treatment effect vs. placebo: ", spp_id[[i]])) +
+    theme_classic()
+  
+   p_angle <- ggplot() +
+    geom_histogram(data = angle_boot_f,
+      aes(x = angle_eff, y = after_stat(density)), 
+                   fill = "darkgrey", alpha = 0.7, bins = 60) +
+    geom_vline(data = angle_boot_f,
+               aes(xintercept = avg_angle_eff), 
+               color = "black", linewidth = 1, linetype = 2) +
+    geom_histogram(data = angle,
+      aes(x = angle_eff, y = after_stat(density)), 
+                   fill = "blue", alpha = 0.5, bins = 60) +
+    geom_vline(data = angle,
+               aes(xintercept = avg_angle_eff), 
+               color = "blue", linewidth = 1, linetype = 2) +
+    labs(title = paste0("Angle treatment effect vs. placebo: ", spp_id[[i]])) +
+    theme_classic()
+   
+   print(p_speed)
+   print(p_angle)
+}
+
+```
+
+
+
+
+
+
+

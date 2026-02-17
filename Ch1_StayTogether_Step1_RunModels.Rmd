@@ -1,0 +1,201 @@
+---
+title: "Ch 1: Staying together"
+subtitle: "Step 1- run models"
+output: html_document
+date: "2025-02-21"
+---
+
+```{r}
+library(tidyverse)
+library(corrr)
+library(mclogit)
+library(MuMIn)
+```
+
+# load in data
+
+```{r}
+data <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/contact_data.rds")
+```
+
+# pre-model data prep
+
+```{r}
+# set all categorical data as factors
+data <- data %>% 
+  mutate(across(c("time_of_day", "season", "species1", "species2", "yr", 
+                  "travel_state", "group_beh"), as.factor))
+```
+
+```{r}
+# assess correlation between variables of interest
+# first, the landscape scale GIS metrics & behavioral metrics
+data %>%
+  select(herb_biom, tree_cover, TRI_90m, travel_state, group_beh,
+         time_of_day, HR_size_km2, prop_HR_overlap) %>% 
+  correlate() %>%
+  rearrange() %>%
+  shave() 
+
+# then, the local scale GIS metrics & behavioral metrics
+data %>%
+  select(rel_herb_biom, rel_tree_cover, rel_TRI_90m, 
+         travel_state, time_of_day, HR_size_km2, prop_HR_overlap, group_beh) %>% 
+  correlate() %>%
+  rearrange() %>%
+  shave() 
+```
+
+```{r}
+# scale and center the continuous variables
+data <- data %>% 
+  mutate(across(c("herb_biom", "tree_cover", "TRI_90m", "HR_size_km2",
+                  "rel_herb_biom", "rel_tree_cover",
+                  "rel_TRI_90m", "prop_HR_overlap"), ~as.numeric(scale(.))))
+
+```
+
+```{r}
+# set stay together as not (0), same species staying together (1), or different species staying together (2)
+data <- data %>% 
+  mutate(stay_tog = if_else(stay_tog == 1 & species1 != species2, 2, stay_tog)) %>% 
+  mutate(stay_tog = as.factor(stay_tog))
+```
+
+# Models 
+
+```{r}
+# pull species
+spp <- unique(data$species1)
+
+# create model list to save all models in
+mod_list <- vector("list", 5) 
+
+# create aic list to save aic tables
+aic_list <- list()
+
+# run models
+for(i in 1:length(spp)){
+  print(i)
+
+df <- data %>% filter(species1 == spp[[i]])
+
+# actual gis global
+mod_list[[i]][["global_actual_gis"]] <- mblogit(stay_tog ~ herb_biom +
+                          tree_cover +
+                          TRI_90m +
+                          HR_size_km2 +
+                          time_of_day +
+                          travel_state +
+                          group_beh +
+                          speed_eff +
+                          angle_eff +
+                          season,
+                          random = (~1|id1/id2),
+                          data = df)
+
+#relative GIS global
+mod_list[[i]][["global_relative_gis"]] <-  mblogit(stay_tog ~ rel_herb_biom +
+                          rel_tree_cover +
+                          rel_TRI_90m +
+                          HR_size_km2 +
+                          time_of_day +
+                          travel_state +
+                          group_beh +
+                          speed_eff +
+                          angle_eff +
+                          season,
+                          random = (~1|id1/id2),
+                          data = df)
+
+
+# now, compare spatial vs. behavioral models
+mod_list[[i]][["spatial"]] <- mblogit(stay_tog ~ herb_biom +
+                          tree_cover +
+                          TRI_90m +
+                          season,
+                          random = (~1|id1/id2),
+                          data = df)
+
+
+mod_list[[i]][["behavioral"]] <- mblogit(stay_tog ~ 
+                          time_of_day +
+                          travel_state +
+                          HR_size_km2 +
+                          group_beh +
+                          speed_eff +
+                          angle_eff +
+                          season,
+                          random = (~1|id1/id2),
+                          data = df)
+
+mod_list[[i]][["social_behav"]] <- mblogit(stay_tog ~ 
+                          group_beh +
+                          speed_eff +
+                          angle_eff +
+                          season,
+                          random = (~1|id1/id2),
+                          data = df)
+
+mod_list[[i]][["spatial_behav"]] <- mblogit(stay_tog ~ 
+                          time_of_day +
+                          travel_state +
+                          HR_size_km2 +
+                          season,
+                          random = (~1|id1/id2),
+                          data = df)
+
+
+mod_list[[i]][["null"]] <- mblogit(stay_tog ~ season,
+                          random = (~1|id1/id2),
+                          data = df)
+
+
+# full aic table
+aic_list[[i]] <- data.frame(
+  model = names(mod_list[[i]]),
+  AIC = sapply(mod_list[[i]], AIC),
+  df = sapply(mod_list[[i]], function(m) attr(logLik(m), "df"))
+)
+
+# Calculate delta AIC
+aic_list[[i]]$deltaAIC <- aic_list[[i]]$AIC - min(aic_list[[i]]$AIC)
+
+# Calculate Akaike weights
+aic_list[[i]]$weight <- with(aic_list[[i]], {
+  delta <- deltaAIC
+  rel_lik <- exp(-0.5 * delta)
+  rel_lik / sum(rel_lik)
+})
+
+# Order by AIC
+aic_list[[i]] <- aic_list[[i]][order(aic_list[[i]]$AIC), ]
+
+# round values
+aic_list[[i]] <- aic_list[[i]] %>% 
+  mutate_if(is.numeric, ~round(., digits = 2))
+
+}
+
+```
+
+```{r}
+# save aic tables as csv
+for(i in 1:length(aic_list)){
+write.csv(aic_list[[i]], row.names = FALSE,
+          file = paste0("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/StayTogether_AICtab_", spp[i], ".csv"))
+}
+```
+
+```{r}
+# save top model per species
+top_mods <- list(mod_list[[1]][["global_actual_gis"]],
+                 mod_list[[2]][["global_actual_gis"]],
+                 mod_list[[3]][["global_actual_gis"]],
+                 mod_list[[4]][["global_relative_gis"]],
+                 mod_list[[5]][["global_actual_gis"]])
+
+names(top_mods) <- spp
+
+saveRDS(top_mods, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/StayTogether_TopModels.rds")
+```

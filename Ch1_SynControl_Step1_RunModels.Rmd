@@ -1,0 +1,249 @@
+---
+title: "Ch 1: Synthetic control- Frequentist [Step 1- run models]"
+author: "Molly Caldwell"
+date: "22-October-2024"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(tidysynth)
+library(future)
+library(furrr)
+library(progressr)
+library(sf)
+library(gsynth)
+```
+
+```{r}
+syn_list <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/syn_data_list_week_control.rds")
+```
+
+# gsynth models
+
+```{r}
+# gsynth function
+run_gsynth <- function(data){
+  
+  treat <- data %>% filter(cid == data$int_id1[[1]] & treatment == 1) %>% 
+    na.omit(Biomass_ForbsGrasses)
+  
+  untreat <- data %>% filter(cid_period == paste0(data$int_id1[[1]], "0")
+                             & treatment == 0)
+  
+  seas <- data %>%  select(season) %>% na.omit()
+  seas <- seas[1,]
+  
+  if(treat$species[[1]] == "pronghorn"){
+    
+    if(seas %in% c("spring", "summer")){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, Biomass_ForbsGrasses,
+         Cover_Trees, IRG_scaled, NDVI_scaled, x, y, rel.angle, angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+}
+  if(seas == "winter"){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, SnowDepth, x, y, rel.angle, 
+           angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0,2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+}else{
+  
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, x, y, rel.angle, 
+           angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 2), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 4)
+}
+
+# create dataframe of model & sample data
+  species <- data$species[1]
+  species2 <- data$species2[1]
+  id1 <- data$int_id1[1]
+  id2 <- data$int_id2[1]
+  date_int <- data$date_int[1]
+  season <- seas
+  time_period <- out_speed[["time"]]
+  post_treat <- out_speed[["post"]][,1]
+  speed_syn <- out_speed[["Y.ct"]][,1]
+  speed_treat <- out_speed[["Y.tr"]][,1]
+  speed_eff <- out_speed[["eff"]][,1]
+  speed_MSPE <- out_speed[["MSPE"]]
+  speed_sigma2 <- out_speed[["sigma2"]]
+  angle_syn <- out_angle[["Y.ct"]][,1]
+  angle_treat <- out_angle[["Y.tr"]][,1]
+  angle_eff <- out_angle[["eff"]][,1]
+  angle_MSPE <- out_angle[["MSPE"]]
+  angle_sigma2 <- out_angle[["sigma2"]]
+  
+df <- data.frame(species, species2, id1, id2, date_int, season, time_period,
+                 post_treat, speed_syn, speed_treat, speed_eff, speed_MSPE,
+                 speed_sigma2, angle_syn, angle_treat, angle_eff, angle_MSPE,
+                 angle_sigma2)
+    
+return(df)      
+    
+}else{
+    
+  if(seas %in% c("spring", "summer")){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, Biomass_ForbsGrasses,
+         Cover_Trees, IRG_scaled, NDVI_scaled, x, y, rel.angle, angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + IRG_scaled + NDVI_scaled + 
+                angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+}
+  if(seas == "winter"){
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, SnowDepth, x, y, rel.angle, 
+           angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + SnowDepth + 
+                angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+}else{
+  data2 <- data %>% 
+    select(cid_period, cid, time_seq, speed, speed_change, treatment, elev, slope, 
+           Biomass_ForbsGrasses, Cover_Trees, x, y, rel.angle, 
+           angle_change)  %>% 
+    na.omit()
+  
+  out_speed <- gsynth(speed ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + speed_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+  
+  out_angle <- gsynth(rel.angle ~ treatment + elev + slope + Biomass_ForbsGrasses +
+                Cover_Trees + angle_change + x + y, data = data2, 
+                  index = c("cid_period","time_seq"), force = "two-way", 
+                  CV = TRUE, r = c(0, 5), se = F, EM = TRUE,
+                  inference = "parametric", na.rm = TRUE, min.T0 = 7)
+}
+
+# create dataframe of model & sample data
+  species <- data$species[1]
+  species2 <- data$species2[1]
+  id1 <- data$int_id1[1]
+  id2 <- data$int_id2[1]
+  date_int <- data$date_int[1]
+  season <- seas
+  time_period <- out_speed[["time"]]
+  post_treat <- out_speed[["post"]][,1]
+  speed_syn <- out_speed[["Y.ct"]][,1]
+  speed_treat <- out_speed[["Y.tr"]][,1]
+  speed_eff <- out_speed[["eff"]][,1]
+  speed_MSPE <- out_speed[["MSPE"]]
+  speed_sigma2 <- out_speed[["sigma2"]]
+  angle_syn <- out_angle[["Y.ct"]][,1]
+  angle_treat <- out_angle[["Y.tr"]][,1]
+  angle_eff <- out_angle[["eff"]][,1]
+  angle_MSPE <- out_angle[["MSPE"]]
+  angle_sigma2 <- out_angle[["sigma2"]]
+  
+df <- data.frame(species, species2, id1, id2, date_int, season, time_period,
+                 post_treat, speed_syn, speed_treat, speed_eff, speed_MSPE,
+                 speed_sigma2, angle_syn, angle_treat, angle_eff, angle_MSPE,
+                 angle_sigma2)
+    
+return(df)    
+}
+}
+
+  # Wrap `run_gsynth` with safely
+  safe_run_gsynth <- safely(run_gsynth, otherwise = "ERROR")
+
+```
+
+```{r}
+
+plan(multisession(workers = availableCores()-1))
+out_list <- list()
+
+for(i in 1:length(syn_list)){
+print(paste("i: ", i))
+
+out_list[[i]] <- with_progress({
+  p <- progressor(steps = length(syn_list[[i]]))
+
+  future_map(syn_list[[i]], ~{
+    p()
+    safe_run_gsynth(.x)
+  }, .options = furrr_options(seed = TRUE))
+})
+}
+
+plan(sequential)
+
+saveRDS(out_list, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/gsynth_treated_output.rds")
+```
+

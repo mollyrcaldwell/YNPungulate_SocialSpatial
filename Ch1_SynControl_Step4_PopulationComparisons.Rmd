@@ -1,0 +1,85 @@
+---
+title: "Ch 1: Synthetic control" 
+subtitle: "Step 4 - model assessment, population comparisons"
+author: "Molly Caldwell"
+date: "12-February-2025"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(glmmTMB)
+```
+
+# load in data
+Synthetic control treated model output with pvalues (from bootstrap method)
+And bootstrapped placebo model output
+
+```{r}
+models <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output_trial/syn_models_output_pval_bayesboot.rds")
+
+boot <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output_trial/placebo_bayesboot_effects.rds")
+```
+
+```{r}
+# combine model and bootstrapped effects into same dataset
+models <- models %>% 
+  dplyr::select(spp_seas, time_period, speed_eff, angle_eff) %>% 
+  mutate(model_type = "treated")
+
+boot <- boot %>% 
+  mutate(model_type = "plac_boot")
+
+data <- bind_rows(models, boot)
+
+# add species 1, species 2, and season
+data <- data %>% 
+  mutate(species = str_split_i(spp_seas, "_", 1),
+         species2 = str_split_i(spp_seas, "_", 2),
+         season = str_split_i(spp_seas, "_", 3),
+         spp_pair = paste(species, species2, sep = "_"))
+
+# add species type (same or different species contact)
+data <- data %>% 
+  mutate(species_type = if_else(species == species2, "same", "different"))
+
+# subset data to time of contact
+data <- data %>% 
+  filter(time_period == 14)
+```
+
+# run models
+Per species
+
+Comparing speed and angle effects between treated & bootstrapped placebo individuals for time of contact 
+
+Including interaction with interacting species type & controlling for season
+
+
+```{r}
+mod_list <- vector(mode = "list", length = 5)
+spp <- unique(data$species)
+
+for(i in 1:length(spp)){
+  print (i)
+  
+  df <- data %>% filter(species == spp[[i]])
+  
+mod_list[[i]][["speed"]] <- glmmTMB(speed_eff ~ model_type * species_type +
+                                      season,
+                     data = df,
+                     family = gaussian())
+
+mod_list[[i]][["angle"]] <- glmmTMB(angle_eff ~ model_type * species_type +
+                                      season,
+                     data = df,
+                     family = gaussian())
+
+}
+
+names(mod_list) <- spp
+```
+
+```{r}
+saveRDS(mod_list, "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/syn_control_pop_mods.rds")
+```

@@ -1,0 +1,202 @@
+---
+title: "Ch 1: Synthetic control"
+subtitle: "Step 5 - population effect plots"
+author: "Molly Caldwell"
+date: "8-April-2025"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(glmmTMB)
+library(patchwork)
+```
+
+# load in data
+
+```{r}
+models <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output_trial/syn_models_output_pval_bayesboot.rds")
+
+boot <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output_trial/placebo_bayesboot_effects.rds")
+```
+
+```{r}
+# combine model and bootstrapped effects into same dataset
+models <- models %>% 
+  dplyr::select(spp_seas, time_period, speed_eff, angle_eff) %>% 
+  mutate(model_type = "treated")
+
+boot <- boot %>% 
+  mutate(model_type = "plac_boot")
+
+data <- bind_rows(models, boot)
+
+# add species 1, species 2, and season
+data <- data %>% 
+  mutate(species = str_split_i(spp_seas, "_", 1),
+         species2 = str_split_i(spp_seas, "_", 2),
+         season = str_split_i(spp_seas, "_", 3),
+         spp_pair = paste(species, species2, sep = "_"))
+
+# add species type (same or different species contact)
+data <- data %>% 
+  mutate(species_type = if_else(species == species2, "same", "different"))
+
+# subset data to time of contact
+data <- data %>% 
+  filter(time_period == 14)
+
+# remove syn control models & bootstrap data
+rm(models)
+rm(boot)
+```
+
+# load in population effect models
+
+```{r}
+mod_list <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/syn_control_pop_mods.rds")
+```
+
+# generate predicted values
+
+```{r}
+# generate predicted speed & angle effect per model
+pred_list <- vector(mode = "list", length = 5)
+spp <- names(mod_list)
+
+for(i in 1:length(spp)){
+  print(i)
+  
+  df <- data %>% filter(species == spp[[i]]) %>% 
+    na.omit()
+  
+pred1 <- expand.grid(
+  model_type = unique(df$model_type),
+  species_type = unique(df$species_type),
+  season = "winter"
+  )
+
+temp <- predict(mod_list[[i]][["speed"]], newdata = pred1, 
+                re.form = ~0, type = "response", se.fit = TRUE)
+
+pred1$predict <- temp[["fit"]]
+pred1$se <- temp[["se.fit"]]
+pred1$response <- "speed"
+pred1$species <- spp[i]
+
+pred2 <- expand.grid(
+  model_type = unique(df$model_type),
+  species_type = unique(df$species_type),
+  season = "winter"
+  )
+
+temp <- predict(mod_list[[i]][["angle"]], newdata = pred2, 
+                re.form = ~0, type = "response", se.fit = TRUE)
+
+pred2$predict <- temp[["fit"]]
+pred2$se <- temp[["se.fit"]]
+pred2$response <- "angle"
+pred2$species <- spp[i]
+
+pred_list[[i]] <- bind_rows(pred1, pred2)
+
+}
+
+
+pred_list <- bind_rows(pred_list)
+```
+
+# plots!
+
+```{r}
+# set species colors
+cols <- c("same species" = "magenta4", "different species" = "darkorange3")
+
+# arrange species by browser -> grazer
+pred_list <- pred_list %>% 
+  mutate(species = factor(species, levels = c("bison", "bighorn",
+                                              "elk", "deer", "pronghorn")))
+
+# set species type to match colors & change model type names
+pred_list <- pred_list %>% 
+  mutate(species_type = if_else(species_type == "same", "same species", 
+                                "different species")) %>% 
+  mutate(model_type = if_else(model_type == "treated",
+                              "empirical", "placebo"))
+
+# arrange model type
+pred_list <- pred_list %>% 
+  mutate(model_type = factor(model_type, levels = c("placebo", "empirical")))
+```
+
+```{r}
+speed_plot <- pred_list %>% 
+  filter(response == "speed") %>%
+  ggplot() +
+  geom_point(aes(x = model_type, y = predict, color = species_type),
+             position = position_dodge(width = 0.1)) +
+  geom_errorbar(aes(x = model_type, ymin = predict - se*1.96,
+                    ymax = predict + se*1.96,
+                    color = species_type), width = 0,
+                position = position_dodge(width = 0.1)) +
+  geom_line(aes(x = model_type, y = predict, color = species_type,
+                group = species_type),
+            linetype = 2) +
+  scale_color_manual(values = cols) +
+  #guides(color = "none") +
+  facet_grid(rows = vars(species)) +
+  scale_y_continuous(breaks = c(-0.1, 0.1, 0.3)) +
+  labs(y = "", x = "") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 10),
+        strip.text = element_blank(),
+        legend.title = element_blank())
+
+angle_plot <- pred_list %>% 
+  filter(response == "angle") %>%
+  ggplot() +
+  geom_point(aes(x = model_type, y = predict, color = species_type),
+             position = position_dodge(width = 0.1)) +
+  geom_errorbar(aes(x = model_type, ymin = predict - se*1.96,
+                    ymax = predict + se*1.96,
+                    color = species_type), width = 0,
+                position = position_dodge(width = 0.1)) +
+  geom_line(aes(x = model_type, y = predict, color = species_type,
+                group = species_type),
+            linetype = 2) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  facet_grid(rows = vars(species)) +
+  scale_y_continuous(breaks = c(-0.2, 0, 0.2)) +
+  labs(y = "", x = "") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 10),
+        strip.text = element_blank(),
+        legend.title = element_blank())
+```
+
+```{r}
+# final plot
+# combine plots
+plot <-
+  (speed_plot | angle_plot) +
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 10)) 
+
+           
+
+ggsave(plot = plot,
+       filename = "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Figures/SynControl_PopEff_PubPlot.png",
+       width = 9,
+       height = 11,
+       units = "cm")
+
+```
+
+
+

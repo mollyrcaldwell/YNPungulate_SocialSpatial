@@ -1,0 +1,950 @@
+---
+title: "Ch 1: Staying together"
+subtitle: "Step 2- plots"
+output: html_document
+date: "2025-04-03"
+---
+
+```{r}
+library(tidyverse)
+library(mclogit)
+library(patchwork)
+library(flextable)
+library(officer)
+```
+
+# Load in data
+
+```{r}
+# top models from step 1
+mod_list <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/StayTogether_TopModels.rds") 
+
+# data used to build model
+data <- readRDS("~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/contact_data.rds")
+
+# set all categorical data as factors
+data <- data %>% 
+  mutate(across(c("time_of_day", "season", "species1", "species2", "yr", 
+                  "travel_state", "group_beh"), as.factor))
+
+# scale and center the continuous variables
+data <- data %>% 
+  mutate(across(c("herb_biom", "tree_cover", "TRI_90m", "HR_size_km2",
+                  "rel_herb_biom", "rel_tree_cover",
+                  "rel_TRI_90m", "prop_HR_overlap"), ~as.numeric(scale(.))))
+
+# set stay together as not (0), same species staying together (1), or different species staying together (2)
+data <- data %>% 
+  mutate(stay_tog = if_else(stay_tog == 1 & species1 != species2, 2, stay_tog)) %>% 
+  mutate(stay_tog = as.factor(stay_tog))
+```
+
+```{r}
+# export coefficient & p-value tables
+coef_df <- list()
+
+for(i in 1:length(mod_list)){
+  sm <- summary(mod_list[[i]])$coefficients
+  
+  coef_df[[i]] <- data.frame(
+    Term = rownames(sm),
+    Estimate = sm[, 1],
+    `Std.Error` = sm[, 2],
+    `P.value` = sm[, 4],
+    row.names = NULL
+  )
+  
+  coef_df[[i]] <- coef_df[[i]] %>%
+    mutate(
+      Estimate = round(Estimate, 3),
+      `Std.Error` = round(`Std.Error`, 3),
+      `P.value` = signif(`P.value`, 3),
+      `P.value` = formatC(`P.value`, format = "e", digits = 3)
+    )
+  
+  coef_df[[i]] <- coef_df[[i]] %>% 
+    mutate(Species = names(mod_list)[[i]],
+           Encounter.with = if_else(str_split_i(Term, "~", 1) == 1, "Same species",
+                                    "Different species"),
+           Predictor = str_split_i(Term, "~", 2)
+             ) %>% 
+    filter(Predictor != "(Intercept)") %>% 
+    select(-Term)
+}
+
+coef_df <- bind_rows(coef_df)
+
+coef_df <- coef_df %>% 
+  select(Species, Predictor, Encounter.with, everything())
+
+coef_df <- coef_df %>% 
+  mutate(Predictor = case_when(
+    str_detect(Predictor, "herb_biom") ~ "Forage biomass",
+    str_detect(Predictor, "tree_cover") ~ "Tree cover",
+    str_detect(Predictor, "TRI_90m") ~ "Ruggedness",
+    str_detect(Predictor, "time_of_dayevening") ~ "Time: evening",
+    str_detect(Predictor, "time_of_daymorning") ~ "Time: morning",
+    str_detect(Predictor, "time_of_daynight") ~ "Time: night",
+    str_detect(Predictor, "HR_size_km2") ~ "Home range area",
+    str_detect(Predictor, "travel_state1") ~ "Behavior state: travel",
+    str_detect(Predictor, "seasonspring") ~ "Season: spring",
+    str_detect(Predictor, "seasonsummer") ~ "Season: summer",
+    str_detect(Predictor, "seasonfall") ~ "Season: fall",
+    str_detect(Predictor, "group_behmoving") ~ "Group behavior: moving",
+    str_detect(Predictor, "group_behstatic") ~ "Group behavior: static",
+    str_detect(Predictor, "speed_eff") ~ "Change in speed",
+    str_detect(Predictor, "angle_eff") ~ "Change in angle"
+  ))
+
+ft <- flextable(coef_df) |>
+  autofit() |>
+  theme_booktabs()
+
+doc <- read_docx() |>
+  body_add_par("Species Encounter Results", style = "heading 1") |>
+  body_add_flextable(ft)
+
+print(doc, target = "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Code output/stayingtog_results.docx")
+```
+
+
+# Generate predictions
+
+```{r}
+# per species and  variable of interest, generate model predicted outcomes
+pred_list <- vector("list", 5)
+
+# pull species names
+spp <- unique(data$species1)
+
+for(i in 1:length(unique(spp))){
+# pull model terms
+terms <- terms(mod_list[[i]])
+
+# pull model formula
+formula <- formula(mod_list[[i]])
+
+# pull fixed effect coefficients
+coefs <- coef(mod_list[[i]])  
+
+# arrange coef in a named list: one set per outcome (e.g., "1", "2")
+coefs_list <- list()
+coefs_list[["1"]] <- coefs[grepl("1~", names(coefs))]
+coefs_list[["2"]] <- coefs[grepl("2~", names(coefs))]
+
+# pull species data
+df <- data %>% filter(species1 == spp[[i]])
+
+# predictions data for species that had actual GIS as top model
+if(spp[[i]] %in% c("bighorn", "bison", "elk", "pronghorn")){
+
+# first, create new data for each variable of interest, holding other predictors constant
+# herb_biomass
+pred_list[[i]][["herb_biom"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  herb_biom = seq(min(df$herb_biom, na.rm = T), 
+                  max(df$herb_biom, na.rm = T), length.out = 20),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# tree_cover
+pred_list[[i]][["tree_cover"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  tree_cover = seq(min(df$tree_cover, na.rm = T), 
+                  max(df$tree_cover, na.rm = T), length.out = 20),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# TRI
+pred_list[[i]][["TRI_90m"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  TRI_90m = seq(min(df$TRI_90m, na.rm = T), 
+                  max(df$TRI_90m, na.rm = T), length.out = 20),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# HR_size
+pred_list[[i]][["HR_size_km2"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = seq(min(df$HR_size_km2, na.rm = T), 
+                  max(df$HR_size_km2, na.rm = T), length.out = 20),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# time of day
+pred_list[[i]][["time_of_day"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = levels(df$time_of_day),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# travel state
+pred_list[[i]][["travel_state"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  travel_state = levels(df$travel_state),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# group behavior
+pred_list[[i]][["group_beh"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  travel_state = factor("0", levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = levels(df$group_beh),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# speed effect
+pred_list[[i]][["speed_eff"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  travel_state = factor("0", levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = seq(min(df$speed_eff, na.rm = T), 
+                  max(df$speed_eff, na.rm = T), length.out = 20),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# angle effect
+pred_list[[i]][["speed_eff"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  travel_state = factor("0", levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  angle_eff = seq(min(df$angle_eff, na.rm = T), 
+                  max(df$angle_eff, na.rm = T), length.out = 20),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# season
+pred_list[[i]][["season"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  herb_biom = mean(df$herb_biom, na.rm = T),
+  TRI_90m = mean(df$TRI_90m, na.rm = T),
+  tree_cover = mean(df$tree_cover, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = levels(df$season))
+}else{
+  # prediction data for species that had relative GIS as top model
+  pred_list[[i]][["herb_biom"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  rel_herb_biom = seq(min(df$rel_herb_biom, na.rm = T), 
+                  max(df$rel_herb_biom, na.rm = T), length.out = 20),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# rel_tree_cover
+pred_list[[i]][["tree_cover"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  rel_tree_cover = seq(min(df$rel_tree_cover, na.rm = T), 
+                  max(df$rel_tree_cover, na.rm = T), length.out = 20),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# TRI
+pred_list[[i]][["TRI_90m"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  rel_TRI_90m = seq(min(df$rel_TRI_90m, na.rm = T), 
+                  max(df$rel_TRI_90m, na.rm = T), length.out = 20),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# HR_size
+pred_list[[i]][["HR_size_km2"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = seq(min(df$HR_size_km2, na.rm = T), 
+                  max(df$HR_size_km2, na.rm = T), length.out = 20),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# time of day
+pred_list[[i]][["time_of_day"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = levels(df$time_of_day),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# travel state
+pred_list[[i]][["travel_state"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  travel_state = levels(df$travel_state),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# group behavior
+pred_list[[i]][["group_beh"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  travel_state = factor("0", levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = levels(df$group_beh),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# speed effect
+pred_list[[i]][["speed_eff"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  travel_state = factor("0", levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = seq(min(df$speed_eff, na.rm = T), 
+                  max(df$speed_eff, na.rm = T), length.out = 20),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# angle effect
+pred_list[[i]][["speed_eff"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  travel_state = factor("0", levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  angle_eff = seq(min(df$angle_eff, na.rm = T), 
+                  max(df$angle_eff, na.rm = T), length.out = 20),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  season = factor("winter", levels = levels(df$season)))
+
+# season
+pred_list[[i]][["season"]] <- expand.grid(
+  stay_tog = unique(df$stay_tog),
+  HR_size_km2 = mean(df$HR_size_km2, na.rm = T),
+  rel_herb_biom = mean(df$rel_herb_biom, na.rm = T),
+  rel_TRI_90m = mean(df$rel_TRI_90m, na.rm = T),
+  rel_tree_cover = mean(df$rel_tree_cover, na.rm = T),
+  travel_state = factor("0", levels = levels(df$travel_state)),
+  time_of_day = factor("day", levels = levels(df$time_of_day)),
+  group_beh = factor("matched", levels = levels(df$group_beh)),
+  speed_eff = mean(df$speed_eff, na.rm = T),
+  angle_eff = mean(df$angle_eff, na.rm = T),
+  season = levels(df$season))
+}
+
+
+for(j in 1:length(pred_list[[i]])){
+
+X_new <- stats::model.matrix(terms, data = pred_list[[i]][[j]])
+
+# generate model predicted outcomes
+pred <- sapply(coefs_list, function(beta) {
+  X_new %*% beta
+})
+
+# convert predictions to probabilities
+pred <- cbind(1, exp(pred))  # first column = reference category
+pred <- pred / rowSums(pred)
+
+# add to df
+pred_list[[i]][[j]]$pred_0 <- pred[,1]
+pred_list[[i]][[j]]$pred_1 <- pred[,2]
+pred_list[[i]][[j]]$pred_2 <- pred[,3]
+
+}
+
+# add standard error estimates for each coeff
+# Stack coefficients (K-1) × p into one vector
+beta_all <- do.call(rbind, coefs_list)
+beta_vec <- as.vector(t(beta_all))  # length = (K-1) * p
+
+# variance-covariance matrix of model
+vcov_mat <- vcov(mod_list[[i]])  # (K-1)*p × (K-1)*p
+
+# loop through each predicted dataset
+
+for(j in 1:length(pred_list[[i]])){
+
+  newdata <- pred_list[[i]][[j]] %>% select(-pred_0, -pred_1, -pred_2)
+  X_new <- model.matrix(formula, data = newdata)
+  
+  n <- nrow(X_new)
+  p <- ncol(X_new)
+  K <- length(coefs_list) + 1  # add reference category
+  
+  se_mat <- matrix(NA, nrow = n, ncol = K)
+
+for (k in 1:n) {
+  x <- X_new[k, , drop = FALSE]  # 1 × p
+
+  # Compute logits for non-reference categories
+  eta <- sapply(coefs_list, function(beta) x %*% beta)
+  eta <- as.numeric(eta)
+
+  # Softmax step
+  logits <- c(0, eta)
+  probs <- exp(logits) / sum(exp(logits))
+
+  # Jacobian of softmax (K × K)
+  J <- diag(probs) - outer(probs, probs)
+
+  # Create full x for (K-1)*p vectorization
+  # Design matrix per category: block matrix
+  x_block <- matrix(0, nrow = K - 1, ncol = (K - 1) * p)
+  for (m in 1:(K - 1)) {
+    idx <- ((m - 1) * p + 1):(m * p)
+    x_block[m, idx] <- x
+  }
+
+  # Variance of linear predictors (K-1 × K-1)
+  V_eta <- x_block %*% vcov_mat %*% t(x_block)
+
+  # Add 0 row/column for reference category
+  V_eta_full <- matrix(0, nrow = K, ncol = K)
+  V_eta_full[2:K, 2:K] <- V_eta
+
+  # Delta method: Var(p) = J %*% V_eta_full %*% t(J)
+  V_p <- J %*% V_eta_full %*% t(J)
+
+  # Standard errors are square roots of diagonal
+  se_mat[k, ] <- sqrt(diag(V_p))
+}
+  pred_list[[i]][[j]]$se_0 <- se_mat[,1]
+  pred_list[[i]][[j]]$se_1 <- se_mat[,2]
+  pred_list[[i]][[j]]$se_2 <- se_mat[,3]
+}
+}
+```
+
+```{r}
+# combine species predicted data for plotting
+
+## first add species variable
+for(i in 1:length(pred_list)){
+  for(j in 1:length(pred_list[[i]])){
+    pred_list[[i]][[j]]$species <- spp[i]
+  }
+}
+
+## then remove rel_ from deer gis variables
+for(j in 1:length(pred_list[[4]])){
+  pred_list[[4]][[j]] <- pred_list[[4]][[j]] %>% 
+    rename_with(~ str_remove(., "^rel_"), starts_with("rel_"))
+}
+
+## finally, combine data
+pred_comb <- list()
+ls_name <- names(pred_list[[1]])
+
+for(i in 1:length(ls_name)){
+pred_comb[[ls_name[[i]]]] <- bind_rows(lapply(pred_list[1:5], 
+                                              `[[`, 
+                                              ls_name[[i]]))
+}
+```
+
+# Coefficients & 95% confidence intervals
+
+```{r}
+# pull exponentiated coefficients & 95% confidence intervals for each model
+coef_list <- list()
+spp <- names(mod_list)
+
+for(i in 1:length(mod_list)){
+  
+  coefs <- coef(mod_list[[i]])
+  
+coefs_1 <- coefs[grepl("1~", names(coefs))]
+coefs_2 <- coefs[grepl("2~", names(coefs))]
+
+ci <-confint(mod_list[[i]])
+
+ci_l_1 <- ci[grepl("1~", row.names(ci)),1]
+ci_u_1 <- ci[grepl("1~", row.names(ci)), 2]
+
+ci_l_2 <- ci[grepl("2~", row.names(ci)),1]
+ci_u_2 <- ci[grepl("2~", row.names(ci)), 2]
+
+coef_list[[i]] <- data.frame(coefs = c(coefs_1, coefs_2),
+                         variable = c(names(coefs_1), names(coefs_2)),
+                         ci_l = c(ci_l_1, ci_l_2),
+                         ci_u = c(ci_u_1, ci_u_2),
+                         species = as.character(spp[[i]]))
+}
+
+coef_list <- bind_rows(coef_list)
+
+row.names(coef_list) <- NULL
+
+coef_list <- coef_list %>% 
+  mutate(species_type = if_else(grepl("1~", variable), "same species",
+                                "different species")) %>% 
+  mutate(variable = str_remove(variable, "1~")) %>% 
+  mutate(variable = str_remove(variable, "2~"))
+
+coef_list <- coef_list %>% 
+  mutate(variable = str_remove(variable, "rel_"))
+         
+```
+
+# Plots
+
+```{r}
+# set species colors
+cols <- c("same species" = "magenta4", "different species" = "darkorange3")
+
+# arrange species by browser -> grazer
+coef_list <- coef_list %>% 
+  mutate(species = factor(species, levels = c("bison", "bighorn",
+                                              "elk", "deer", "pronghorn")))
+```
+
+```{r}
+TRI_90m <- coef_list %>% 
+  filter(variable %in% c("TRI_90m")) %>%
+ggplot(aes(x = coefs, y = species, color = species_type)) +
+  geom_point(position = position_dodge(width = 1.5)) + 
+  geom_errorbar(aes(xmin = ci_l, xmax = ci_u), width = 0,
+                position = position_dodge(width = 1.5)) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey") +
+   coord_cartesian(xlim = c(-1.5, 1.5)) + 
+  scale_x_continuous(breaks = c(-1, 0, 1)) +
+  labs(y = "", x = "Ruggedness (coefficient)", title = "C") +
+  facet_grid(rows = vars(species)) +
+  theme_classic() +
+theme(legend.position = "bottom",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text = element_blank(),
+        title = element_text(size = 10))
+
+tree_cover <- coef_list %>% 
+  filter(variable %in% c("tree_cover")) %>%
+ggplot(aes(x = coefs, y = species, color = species_type)) +
+  geom_point(position = position_dodge(width = 1.5)) + 
+  geom_errorbar(aes(xmin = ci_l, xmax = ci_u), width = 0,
+                position = position_dodge(width = 1.5)) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey") +
+  coord_cartesian(xlim = c(-1.5, 1.5)) + 
+  scale_x_continuous(breaks = c(-1, 0, 1)) +
+  labs(y = "", x = "Tree cover (coefficient)", title = "B") +
+  facet_grid(rows = vars(species)) +
+  theme_classic() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text = element_blank(),
+        title = element_text(size = 10))
+
+herb_biom <- coef_list %>% 
+  filter(variable %in% c("herb_biom")) %>%
+ggplot(aes(x = coefs, y = species, color = species_type)) +
+  geom_point(position = position_dodge(width = 1.5)) + 
+  geom_errorbar(aes(xmin = ci_l, xmax = ci_u), width = 0,
+                position = position_dodge(width = 1.5)) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey") +
+  coord_cartesian(xlim = c(-0.5, 0.5)) + 
+  scale_x_continuous(breaks = c(-0.5, 0, 0.5)) +
+  labs(y = "", x = "Forage biomass (coefficient)", title = "A") +
+  facet_grid(rows = vars(species)) +
+  theme_classic() +
+ theme(legend.position = "bottom",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text = element_blank(),
+        title = element_text(size = 10))
+
+HR_size_km2 <- coef_list %>% 
+  filter(variable %in% c("HR_size_km2")) %>%
+ggplot(aes(x = coefs, y = species, color = species_type)) +
+  geom_point(position = position_dodge(width = 1.5)) + 
+  geom_errorbar(aes(xmin = ci_l, xmax = ci_u), width = 0,
+                position = position_dodge(width = 1.5)) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey") +
+   coord_cartesian(xlim = c(-4, 4)) + 
+  scale_x_continuous(breaks = c(-3, 0, 3)) +
+  labs(y = "", x = "Home range area (coefficient)", title = "A") +
+  facet_grid(rows = vars(species)) +
+  theme_classic() +
+theme(legend.position = "bottom",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text = element_blank(),
+        title = element_text(size = 10))
+
+
+speed_eff <- coef_list %>% 
+  filter(variable %in% c("speed_eff")) %>%
+ggplot(aes(x = coefs, y = species, color = species_type)) +
+  geom_point(position = position_dodge(width = 1.5)) + 
+  geom_errorbar(aes(xmin = ci_l, xmax = ci_u), width = 0,
+                position = position_dodge(width = 1.5)) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey") +
+   coord_cartesian(xlim = c(-1, 1)) + 
+  scale_x_continuous(breaks = c(-1, 0, 1)) +
+  facet_grid(rows = vars(species)) +
+  labs(x = "Change in speed (coefficient)", y = "", title = "E") +
+  theme_classic() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text = element_blank(),
+        title = element_text(size = 10))
+
+
+angle_eff <- coef_list %>% 
+  filter(variable %in% c("angle_eff")) %>%
+ggplot(aes(x = coefs, y = species, color = species_type)) +
+  geom_point(position = position_dodge(width = 1.5)) + 
+  geom_errorbar(aes(xmin = ci_l, xmax = ci_u), width = 0,
+                position = position_dodge(width = 1.5)) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey") +
+   coord_cartesian(xlim = c(-0.5, 0.5)) + 
+  scale_x_continuous(breaks = c(-0.5, 0, 0.5)) +
+  facet_grid(rows = vars(species)) +
+  labs(x = "Change in angle (coefficient)", y = "", title = "F") +
+  theme_classic() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text = element_blank(),
+        title = element_text(size = 10))
+
+        
+```
+
+```{r}
+pred1 <- pred_comb[["time_of_day"]] %>% 
+  select(pred_1, se_1, species, time_of_day) %>% 
+  rename(pred = pred_1, se = se_1) %>% 
+  mutate(species_type = "same species")
+
+pred2 <- pred_comb[["time_of_day"]] %>% 
+  select(pred_2, se_2, species, time_of_day) %>% 
+  rename(pred = pred_2, se = se_2) %>% 
+  mutate(species_type = "different species")
+
+time_df <- bind_rows(pred1, pred2)
+
+time_df <- time_df %>% 
+  group_by(species, species_type) %>% 
+  mutate(scale_pred = pred / mean(pred)) %>% 
+  ungroup()
+
+time_df <- time_df %>%  
+  mutate(species = factor(species, levels = c("bison", "bighorn",
+                                              "elk", "deer", "pronghorn")))
+
+time_of_day <- time_df %>% 
+  mutate(time_of_day = factor(time_of_day, levels = c("morning", "day",
+                                                      "evening", "night"))) %>%
+  ggplot() +
+  geom_point(aes(x = time_of_day, y = scale_pred, color = species_type)) +
+  geom_line(aes(x = time_of_day, y = scale_pred, color = species_type,
+                group = species_type),
+            linetype = 2) +
+  scale_color_manual(values = cols) +
+  guides(color = "none") +
+  facet_grid(rows = vars(species)) +
+  scale_y_continuous(breaks = c(0.75, 2)) +
+  labs(y = "Relative probability stay together", x = "", title = "B") +
+  theme_classic() +
+   theme(
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        strip.text = element_blank(),
+        legend.title = element_blank()) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        title = element_text(size = 10)) 
+  
+```
+
+```{r}
+pred1 <- pred_comb[["travel_state"]] %>% 
+  select(pred_1, se_1, species, travel_state) %>% 
+  rename(pred = pred_1, se = se_1) %>% 
+  mutate(species_type = "same species")
+
+pred2 <- pred_comb[["travel_state"]] %>% 
+  select(pred_2, se_2, species, travel_state) %>% 
+  rename(pred = pred_2, se = se_2) %>% 
+  mutate(species_type = "different species")
+
+travel_df <- bind_rows(pred1, pred2)
+
+travel_df <- travel_df %>% 
+  group_by(species, species_type) %>% 
+  mutate(scale_pred = pred / mean(pred)) %>% 
+  ungroup()
+
+travel_df <- travel_df %>%  
+  mutate(species = factor(species, levels = c("bison", "bighorn",
+                                              "elk", "deer", "pronghorn"))) %>% 
+  mutate(travel_state = if_else(travel_state == 1, "travel", "encamped"))
+
+travel_state <- travel_df %>%
+  ggplot() +
+  geom_point(aes(x = travel_state, y = scale_pred, color = species_type)) +
+  geom_line(aes(x = travel_state, y = scale_pred, color = species_type,
+                group = species_type),
+            linetype = 2) +
+  scale_color_manual(values = cols) +
+  facet_grid(rows = vars(species)) +
+  scale_y_continuous(breaks = c(0, 2)) +
+  labs(y = "Relative probability stay together", x = "", title = "C") +
+  theme_classic() +
+   theme(
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        strip.text = element_blank(),
+        legend.title = element_blank()) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        title = element_text(size = 10)) 
+  
+```
+
+```{r}
+pred1 <- pred_comb[["group_beh"]] %>% 
+  select(pred_1, se_1, species, group_beh) %>% 
+  rename(pred = pred_1, se = se_1) %>% 
+  mutate(species_type = "same species")
+
+pred2 <- pred_comb[["group_beh"]] %>% 
+  select(pred_2, se_2, species, group_beh) %>% 
+  rename(pred = pred_2, se = se_2) %>% 
+  mutate(species_type = "different species")
+
+group_df <- bind_rows(pred1, pred2)
+
+group_df <- group_df %>% 
+  group_by(species, species_type) %>% 
+  mutate(scale_pred = pred / mean(pred)) %>% 
+  ungroup()
+
+group_df <- group_df %>%  
+  mutate(species = factor(species, levels = c("bison", "bighorn",
+                                              "elk", "deer", "pronghorn")))
+
+group_beh <- group_df %>%
+  ggplot() +
+  geom_point(aes(x = group_beh, y = scale_pred, color = species_type)) +
+  geom_line(aes(x = group_beh, y = scale_pred, color = species_type,
+                group = species_type),
+            linetype = 2) +
+  scale_color_manual(values = cols) +
+  facet_grid(rows = vars(species)) +
+  guides(color = "none") +
+  scale_y_continuous(breaks = c(0.5, 1.5)) +
+  labs(y = "Relative probability stay together", x = "", title = "D") +
+  theme_classic() +
+  theme(
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        strip.text = element_blank(),
+        legend.title = element_blank()) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        title = element_text(size = 10)) 
+```
+
+```{r}
+pred1 <- pred_comb[["season"]] %>% 
+  select(pred_1, se_1, species, season) %>% 
+  rename(pred = pred_1, se = se_1) %>% 
+  mutate(species_type = "same species")
+
+pred2 <- pred_comb[["season"]] %>% 
+  select(pred_2, se_2, species, season) %>% 
+  rename(pred = pred_2, se = se_2) %>% 
+  mutate(species_type = "different species")
+
+season_df <- bind_rows(pred1, pred2)
+
+season_df <- season_df %>% 
+  group_by(species, species_type) %>% 
+  mutate(scale_pred = pred / mean(pred)) %>% 
+  ungroup()
+
+season_df <- season_df %>%  
+  mutate(species = factor(species, levels = c("bison", "bighorn",
+                                              "elk", "deer", "pronghorn"))) %>% 
+  mutate(season = factor(season, levels = c("spring", "summer", "fall", "winter")))
+
+season <- season_df %>%
+  ggplot() +
+  geom_point(aes(x = season, y = scale_pred, color = species_type)) +
+  geom_line(aes(x = season, y = scale_pred, color = species_type,
+                group = species_type),
+            linetype = 2) +
+  scale_color_manual(values = cols) +
+  facet_grid(rows = vars(species)) +
+  scale_y_continuous(breaks = c(0 , 2)) +
+  labs(y = "Relative probability stay together", x = "", title = "D") +
+  theme_classic() +
+  theme(
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 8),
+        strip.text = element_blank(),
+        legend.title = element_blank()) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        title = element_text(size = 10)) 
+  
+```
+
+```{r}
+# final plot
+# combine plots
+stay_tog_plot_spatial_env <-
+  (herb_biom | tree_cover) / 
+  (TRI_90m | season) +
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 10)) 
+
+stay_tog_plot_beh <-
+  (HR_size_km2 | time_of_day | travel_state) / 
+   (group_beh | speed_eff | angle_eff) +
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 10)) 
+           
+
+ggsave(plot = stay_tog_plot_spatial_env,
+       filename = "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Figures/StayTogether_PubPlot_SpatialENV.png",
+       width = 4.5,
+       height = 6,
+       units = "in")
+
+ggsave(plot = stay_tog_plot_beh,
+       filename = "~/OneDrive - University of Wyoming/Documents/UWyo/PhD project/PhD_Chapter_1/Figures/StayTogether_PubPlot_Beh.png",
+       width = 6.5,
+       height = 6.5,
+       units = "in")
+```
